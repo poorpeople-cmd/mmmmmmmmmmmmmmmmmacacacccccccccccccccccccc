@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'Normal website/player webpage URL (https://example.org/watch)'
+        description: 'Normal authorized webpage URL, e.g. https://example.org/watch'
         required: true
         type: string
 
@@ -18,30 +18,30 @@ concurrency:
 
 jobs:
   webpage-relay:
+    name: Open webpage and capture authorized playback
     runs-on: ubuntu-24.04
-    timeout-minutes: 345
+    timeout-minutes: 90
 
     env:
       TARGET_URL: ${{ inputs.target_url }}
-
-      # Change these defaults here, not in workflow inputs.
       OKRU_STREAM_ID: '1'
       STREAM_QUALITY: '720p'
       DURATION_MINUTES: '60'
-
       PULSE_SINK: stream_sink
-      XDG_RUNTIME_DIR: ${{ runner.temp }}/pulse-runtime
 
     steps:
-      - name: Checkout code
+      # STEP 1: Checkout repository
+      - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Use Node.js 24
+      # STEP 2: Node.js
+      - name: Set up Node.js 24
         uses: actions/setup-node@v7
         with:
           node-version: '24'
 
-      - name: Install browser-capture dependencies
+      # STEP 3: Install dependencies
+      - name: Install FFmpeg, virtual display and audio packages
         shell: bash
         run: |
           set -euo pipefail
@@ -57,49 +57,85 @@ jobs:
 
           command -v ffmpeg
           command -v Xvfb
+          command -v pactl
 
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264
-          ffmpeg -hide_banner -devices 2>/dev/null | grep -q x11grab
-          ffmpeg -hide_banner -devices 2>/dev/null | grep -q pulse
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264'
+          ffmpeg -hide_banner -devices 2>/dev/null | grep 'x11grab'
+          ffmpeg -hide_banner -devices 2>/dev/null | grep 'pulse'
 
-      - name: Install Puppeteer with Chrome for Testing
+      # STEP 4: Install Chrome/Puppeteer
+      - name: Install Puppeteer and browser
         shell: bash
         run: |
           set -euo pipefail
 
           npm install --no-save --no-audit --no-fund puppeteer@24
 
-          node -e "console.log(require('puppeteer').executablePath())"
+          node -e "console.log('Chrome path:', require('puppeteer').executablePath())"
 
-      - name: Check JavaScript
+      # STEP 5: Check JavaScript and URL
+      - name: Validate stream.js and normal webpage URL
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f stream.js
+          test -f stream.js || {
+            echo 'ERROR: stream.js not found at repository root'
+            exit 1
+          }
 
           node --check stream.js
 
           node stream.js --check
 
-      - name: Prepare PulseAudio virtual sink
+          node -e '
+            const value = process.env.TARGET_URL;
+
+            if (!value) {
+              throw new Error("target_url is required");
+            }
+
+            const u = new URL(value);
+
+            if (!["http:", "https:"].includes(u.protocol)) {
+              throw new Error("target_url must begin with http:// or https://");
+            }
+
+            console.log("URL validated for host:", u.hostname);
+          '
+
+      # STEP 6: Correct PulseAudio runtime configuration
+      - name: Set up PulseAudio runtime path
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$XDG_RUNTIME_DIR"
-          chmod 700 "$XDG_RUNTIME_DIR"
+          AUDIO_RUNTIME="$RUNNER_TEMP/pulse-runtime"
+
+          mkdir -p "$AUDIO_RUNTIME"
+
+          chmod 700 "$AUDIO_RUNTIME"
+
+          echo "XDG_RUNTIME_DIR=$AUDIO_RUNTIME" >> "$GITHUB_ENV"
+
+      # STEP 7: Start virtual audio system
+      - name: Start PulseAudio with a virtual capture sink
+        shell: bash
+        run: |
+          set -euo pipefail
 
           pulseaudio --start --exit-idle-time=-1 || true
 
-          for i in {1..15}; do
-            if pactl info >/dev/null 2>&1; then break; fi
+          for attempt in {1..15}; do
+            if pactl info >/dev/null 2>&1; then
+              break
+            fi
             sleep 1
           done
 
           pactl info >/dev/null
 
-          if ! pactl list short sinks | grep -q stream_sink; then
+          if ! pactl list short sinks | grep -F 'stream_sink' >/dev/null; then
             pactl load-module module-null-sink \
               sink_name=stream_sink \
               sink_properties=device.description=StreamSink
@@ -107,19 +143,31 @@ jobs:
 
           pactl set-default-sink stream_sink
 
-          pactl list short sources | grep stream_sink.monitor
+          pactl list short sources | grep -F 'stream_sink.monitor'
 
-      - name: Launch webpage and capture it
+      # STEP 8: Launch virtual display and stream engine
+      - name: Launch virtual display and browser stream engine
         shell: bash
         run: |
           set -euo pipefail
 
           case "$STREAM_QUALITY" in
-            360p) SIZE=640x360 ;;
-            480p) SIZE=854x480 ;;
-            720p) SIZE=1280x720 ;;
-            1080p) SIZE=1920x1080 ;;
-            *) echo 'Invalid STREAM_QUALITY'; exit 1 ;;
+            360p)
+              SIZE='640x360'
+              ;;
+            480p)
+              SIZE='854x480'
+              ;;
+            720p)
+              SIZE='1280x720'
+              ;;
+            1080p)
+              SIZE='1920x1080'
+              ;;
+            *)
+              echo 'Invalid STREAM_QUALITY'
+              exit 1
+              ;;
           esac
 
           xvfb-run --auto-servernum \
