@@ -1,175 +1,162 @@
 
-name: Browser Webpage Relay
+name: Browser Webpage Relay - Full Controls
 
 on:
   workflow_dispatch:
     inputs:
-      target_url:
-        description: 'Normal authorized webpage URL, e.g. https://example.org/watch'
+      target_urls:
+        description: 'Normal webpage URL(s), separated by | if using backups. No m3u8 needed.'
         required: true
+        type: string
+
+      okru_stream_channel:
+        description: 'OK.ru channel ID from embedded STREAM_KEYS, e.g. 1, 1.1, 3, s1.1'
+        required: true
+        default: '1'
+        type: string
+
+      server_selection:
+        description: 'Optional visible player server/button label; None means no selection'
+        required: true
+        default: 'None'
+        type: string
+
+      stream_quality:
+        description: 'Video output resolution'
+        required: true
+        default: '720p'
+        type: choice
+        options:
+          - '360p'
+          - '480p'
+          - '720p'
+          - '1080p'
+
+      proxy_engine:
+        description: 'Direct, or custom proxy configured as BROWSER_PROXY_URL secret'
+        required: true
+        default: 'None'
+        type: choice
+        options:
+          - 'None'
+          - 'Custom proxy'
+
+      enable_stream_audio:
+        description: 'Record permitted webpage audio or send silent AAC'
+        required: true
+        default: 'ON'
+        type: choice
+        options:
+          - 'ON'
+          - 'OFF'
+
+      custom_duration:
+        description: 'e.g. 30m, 1h 10m, 24/7; max 330m per run'
+        required: true
+        default: '60m'
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: browser-relay-${{ github.repository }}
+  group: browser-relay-${{ github.repository }}-${{ inputs.okru_stream_channel }}
   cancel-in-progress: false
 
 jobs:
-  webpage-relay:
-    name: Open webpage and capture authorized playback
+  browser-relay:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 345
 
     env:
-      TARGET_URL: ${{ inputs.target_url }}
-      OKRU_STREAM_ID: '1'
-      STREAM_QUALITY: '720p'
-      DURATION_MINUTES: '60'
+      TARGET_URLS: ${{ inputs.target_urls }}
+      OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
+      SERVER_SELECTION: ${{ inputs.server_selection }}
+      STREAM_QUALITY: ${{ inputs.stream_quality }}
+      PROXY_ENGINE: ${{ inputs.proxy_engine }}
+      ENABLE_STREAM_AUDIO: ${{ inputs.enable_stream_audio }}
+      CUSTOM_DURATION: ${{ inputs.custom_duration }}
+      BROWSER_PROXY_URL: ${{ secrets.BROWSER_PROXY_URL }}
       PULSE_SINK: stream_sink
 
     steps:
-      # STEP 1: Checkout repository
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v7
 
-      # STEP 2: Node.js
       - name: Set up Node.js 24
         uses: actions/setup-node@v7
         with:
           node-version: '24'
 
-      # STEP 3: Install dependencies
-      - name: Install FFmpeg, virtual display and audio packages
+      - name: Install FFmpeg, virtual display and audio
         shell: bash
         run: |
           set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y --no-install-recommends \
             ffmpeg xvfb xauth openbox pulseaudio pulseaudio-utils \
             libnss3 libgbm1 libasound2t64 libatk1.0-0t64 \
             libatk-bridge2.0-0t64 libxcomposite1 libxdamage1 \
             libxrandr2 libx11-xcb1 libpangocairo-1.0-0 \
             libatspi2.0-0t64 libcups2t64
-
           command -v ffmpeg
           command -v Xvfb
           command -v pactl
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -F 'libx264'
+          ffmpeg -hide_banner -devices 2>/dev/null | grep -F 'x11grab'
+          ffmpeg -hide_banner -devices 2>/dev/null | grep -F 'pulse'
 
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264'
-          ffmpeg -hide_banner -devices 2>/dev/null | grep 'x11grab'
-          ffmpeg -hide_banner -devices 2>/dev/null | grep 'pulse'
-
-      # STEP 4: Install Chrome/Puppeteer
-      - name: Install Puppeteer and browser
+      - name: Install Chrome and Puppeteer
         shell: bash
         run: |
           set -euo pipefail
+          DEPS_DIR="$RUNNER_TEMP/browser-relay-deps"
+          mkdir -p "$DEPS_DIR"
+          npm install --prefix "$DEPS_DIR" --no-save --no-audit --no-fund puppeteer@24
+          echo "NODE_PATH=$DEPS_DIR/node_modules" >> "$GITHUB_ENV"
+          NODE_PATH="$DEPS_DIR/node_modules" node -e "const p = require('puppeteer'); console.log('Chrome:', p.executablePath())"
 
-          npm install --no-save --no-audit --no-fund puppeteer@24
-
-          node -e "console.log('Chrome path:', require('puppeteer').executablePath())"
-
-      # STEP 5: Check JavaScript and URL
-      - name: Validate stream.js and normal webpage URL
+      - name: Check full browser relay configuration
         shell: bash
         run: |
           set -euo pipefail
-
-          test -f stream.js || {
-            echo 'ERROR: stream.js not found at repository root'
-            exit 1
-          }
-
+          test -f stream.js || { echo 'ERROR: stream.js missing from repository root'; exit 1; }
           node --check stream.js
-
           node stream.js --check
 
-          node -e '
-            const value = process.env.TARGET_URL;
-
-            if (!value) {
-              throw new Error("target_url is required");
-            }
-
-            const u = new URL(value);
-
-            if (!["http:", "https:"].includes(u.protocol)) {
-              throw new Error("target_url must begin with http:// or https://");
-            }
-
-            console.log("URL validated for host:", u.hostname);
-          '
-
-      # STEP 6: Correct PulseAudio runtime configuration
-      - name: Set up PulseAudio runtime path
+      - name: Prepare PulseAudio runtime and sink
         shell: bash
         run: |
           set -euo pipefail
-
           AUDIO_RUNTIME="$RUNNER_TEMP/pulse-runtime"
-
           mkdir -p "$AUDIO_RUNTIME"
-
           chmod 700 "$AUDIO_RUNTIME"
-
           echo "XDG_RUNTIME_DIR=$AUDIO_RUNTIME" >> "$GITHUB_ENV"
-
-      # STEP 7: Start virtual audio system
-      - name: Start PulseAudio with a virtual capture sink
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          export XDG_RUNTIME_DIR="$AUDIO_RUNTIME"
           pulseaudio --start --exit-idle-time=-1 || true
-
           for attempt in {1..15}; do
-            if pactl info >/dev/null 2>&1; then
-              break
-            fi
+            if pactl info >/dev/null 2>&1; then break; fi
             sleep 1
           done
-
           pactl info >/dev/null
-
           if ! pactl list short sinks | grep -F 'stream_sink' >/dev/null; then
-            pactl load-module module-null-sink \
-              sink_name=stream_sink \
+            pactl load-module module-null-sink sink_name=stream_sink \
               sink_properties=device.description=StreamSink
           fi
-
           pactl set-default-sink stream_sink
-
           pactl list short sources | grep -F 'stream_sink.monitor'
 
-      # STEP 8: Launch virtual display and stream engine
-      - name: Launch virtual display and browser stream engine
+      - name: Launch virtual display and streaming engine
         shell: bash
         run: |
           set -euo pipefail
-
           case "$STREAM_QUALITY" in
-            360p)
-              SIZE='640x360'
-              ;;
-            480p)
-              SIZE='854x480'
-              ;;
-            720p)
-              SIZE='1280x720'
-              ;;
-            1080p)
-              SIZE='1920x1080'
-              ;;
-            *)
-              echo 'Invalid STREAM_QUALITY'
-              exit 1
-              ;;
+            360p) SIZE='640x360' ;;
+            480p) SIZE='854x480' ;;
+            720p) SIZE='1280x720' ;;
+            1080p) SIZE='1920x1080' ;;
+            *) echo 'Invalid quality'; exit 1 ;;
           esac
-
           xvfb-run --auto-servernum \
             --server-args="-screen 0 ${SIZE}x24 -ac -nolisten tcp" \
-            bash -c 'openbox >/tmp/relay-openbox.log 2>&1 & exec node stream.js'
+            bash -c 'openbox >/tmp/browser-relay-openbox.log 2>&1 & exec node stream.js'
