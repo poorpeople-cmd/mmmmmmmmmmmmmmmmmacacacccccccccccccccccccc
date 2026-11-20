@@ -1,146 +1,127 @@
 
-name: StreamGuard - OK.ru FFmpeg Relay
+name: Browser Webpage Relay
 
 on:
   workflow_dispatch:
     inputs:
-      target_urls:
-        description: 'Authorized DIRECT media URLs (m3u8, MP4 or RTMP); separate multiple URLs with |. Leave blank to use SOURCE_URLS secret.'
-        required: false
-        type: string
-        default: ''
-
-      okru_stream_channel:
-        description: 'Choose the channel ID from STREAM_KEYS in stream.js'
+      target_url:
+        description: 'Normal website/player webpage URL (https://example.org/watch)'
         required: true
         type: string
-        default: '1'
-
-      stream_quality:
-        description: 'Encoding resolution'
-        required: true
-        type: choice
-        options:
-          - 360p
-          - 480p
-          - 720p
-          - 1080p
-        default: 720p
-
-      custom_duration:
-        description: '30m, 1h 10m, or 24/7 (one GitHub run is capped at 330 minutes)'
-        required: true
-        type: string
-        default: '30m'
 
 permissions:
   contents: read
 
 concurrency:
-  group: streamguard-${{ github.repository }}-${{ inputs.okru_stream_channel }}
+  group: browser-relay-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  stream:
-    name: FFmpeg StreamGuard Relay
+  webpage-relay:
     runs-on: ubuntu-24.04
     timeout-minutes: 345
 
     env:
-      OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
-      STREAM_QUALITY: ${{ inputs.stream_quality }}
-      CUSTOM_DURATION: ${{ inputs.custom_duration }}
+      TARGET_URL: ${{ inputs.target_url }}
 
-      MAX_RUN_MINUTES: '330'
-      STARTUP_GRACE_SECONDS: '45'
-      STALL_SECONDS: '30'
-      HEALTH_PORT: '0'
-      VOD_PACE: 'OFF'
+      # Change these defaults here, not in workflow inputs.
+      OKRU_STREAM_ID: '1'
+      STREAM_QUALITY: '720p'
+      DURATION_MINUTES: '60'
 
-      # Inputs take precedence. To hide private media URLs,
-      # use the SOURCE_URLS repository secret.
-      SOURCE_URLS: ${{ inputs.target_urls || secrets.SOURCE_URLS }}
+      PULSE_SINK: stream_sink
+      XDG_RUNTIME_DIR: ${{ runner.temp }}/pulse-runtime
 
     steps:
-      # ===================================================
-      # STEP 1 - Checkout repository
-      # ===================================================
-
-      - name: Check out repository
+      - name: Checkout code
         uses: actions/checkout@v7
 
-      # ===================================================
-      # STEP 2 - Setup Node.js
-      # ===================================================
-
-      - name: Set up Node.js 24
+      - name: Use Node.js 24
         uses: actions/setup-node@v7
         with:
           node-version: '24'
 
-      # ===================================================
-      # STEP 3 - Install and verify FFmpeg
-      # ===================================================
-
-      - name: Install and verify FFmpeg
+      - name: Install browser-capture dependencies
         shell: bash
         run: |
           set -euo pipefail
 
           sudo apt-get update
 
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg xvfb xauth openbox pulseaudio pulseaudio-utils \
+            libnss3 libgbm1 libasound2t64 libatk1.0-0t64 \
+            libatk-bridge2.0-0t64 libxcomposite1 libxdamage1 \
+            libxrandr2 libx11-xcb1 libpangocairo-1.0-0 \
+            libatspi2.0-0t64 libcups2t64
 
-          echo 'FFmpeg binary:'
           command -v ffmpeg
+          command -v Xvfb
 
-          ffmpeg -hide_banner -version | sed -n '1p'
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264
+          ffmpeg -hide_banner -devices 2>/dev/null | grep -q x11grab
+          ffmpeg -hide_banner -devices 2>/dev/null | grep -q pulse
 
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep libx264 >/dev/null || {
-            echo 'ERROR: libx264 encoder is missing'
-            exit 1
-          }
-
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep ' aac ' >/dev/null || {
-            echo 'ERROR: AAC encoder is missing'
-            exit 1
-          }
-
-      # ===================================================
-      # STEP 4 - Validate JavaScript and inputs
-      # ===================================================
-
-      - name: Validate script and media source configuration
+      - name: Install Puppeteer with Chrome for Testing
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f stream.js || {
-            echo 'ERROR: stream.js is missing from repository root'
-            exit 1
-          }
+          npm install --no-save --no-audit --no-fund puppeteer@24
 
-          node --version
+          node -e "console.log(require('puppeteer').executablePath())"
+
+      - name: Check JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f stream.js
 
           node --check stream.js
 
-          if [ -z "${SOURCE_URLS:-}" ]; then
-            echo 'ERROR: Supply target_urls when running workflow, or set SOURCE_URLS under repository Actions secrets.'
-            exit 1
+          node stream.js --check
+
+      - name: Prepare PulseAudio virtual sink
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          pulseaudio --start --exit-idle-time=-1 || true
+
+          for i in {1..15}; do
+            if pactl info >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          pactl info >/dev/null
+
+          if ! pactl list short sinks | grep -q stream_sink; then
+            pactl load-module module-null-sink \
+              sink_name=stream_sink \
+              sink_properties=device.description=StreamSink
           fi
 
-          echo 'JavaScript syntax passed; media sources configured.'
+          pactl set-default-sink stream_sink
 
-      # ===================================================
-      # STEP 5 - Test FFmpeg codecs
-      # ===================================================
+          pactl list short sources | grep stream_sink.monitor
 
-      - name: Run codec self-test
-        run: node stream.js --self-test
+      - name: Launch webpage and capture it
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      # ===================================================
-      # STEP 6 - Launch streaming engine
-      # ===================================================
+          case "$STREAM_QUALITY" in
+            360p) SIZE=640x360 ;;
+            480p) SIZE=854x480 ;;
+            720p) SIZE=1280x720 ;;
+            1080p) SIZE=1920x1080 ;;
+            *) echo 'Invalid STREAM_QUALITY'; exit 1 ;;
+          esac
 
-      - name: Launch FFmpeg stream engine
-        run: node stream.js
+          xvfb-run --auto-servernum \
+            --server-args="-screen 0 ${SIZE}x24 -ac -nolisten tcp" \
+            bash -c 'openbox >/tmp/relay-openbox.log 2>&1 & exec node stream.js'
