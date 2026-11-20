@@ -1,1035 +1,1781 @@
 
-'use strict';
-
-/**
- * Browser streaming of authorized, unprotected webpages.
- * Regular webpage URLs only; no DRM or access-control bypass.
- * Legacy OK.ru publishing keys are embedded below at user's request.
- * IMPORTANT: rotate these exposed credentials and keep source private.
- */
-
 const puppeteer = require('puppeteer');
-const { spawn } = require('node:child_process');
 
-const STREAM_KEYS = Object.freeze({
-  '1': '15254238731883_15281627925099_najspfkgne',
-  '1.1': '15254260751979_15281671637611_2plrcfqzze',
-  '1.2': '15254285524587_15281717840491_7e6qdknzsu',
-  '1.3': '16983200374379_18360218880619_efmw4fchxm',
-  '1.4': '16983242579563_18360288741995_t2kh2jvcym',
-  '1.5': '16983247822443_18360297982571_3zs5ml7gua',
-  '1.6': '16983254834795_18360310237803_xrz3pf4uea',
-  '1.7': '16983259553387_18360317971051_6khoe5efge',
-  '1.8': '16983264468587_18360327342699_wsn7zgr7ee',
-  '1.9': '16983269514859_18360335075947_363qzjlbte',
-  '1.10': '16983277641323_18360347921003_rpf6hkqpdm',
-  '1.11': '16983286554219_18360360503915_lrqraxbz3y',
-  '2': '15254299352683_15281743071851_7dvz3h5d7q',
-  '2.1': '15254308986475_15281761618539_3xca7oij3u',
-  '2.2': '15254328122987_15281795566187_zjqa6bqzoq',
-  '3': '15254341885547_15281821059691_hhlpb5vicy',
-  '3.1': '15254357089899_15281848322667_sxeexgvzl4',
-  '3.2': '15254367510123_15281868180075_pc4jrytfgm',
-  '3.3': '17485986405995_19233134873195_iw63xjblny',
-  '3.4': '17485996039787_19233150929515_d3yeoweuam',
-  '3.5': '17486002789995_19233161611883_mbg22slybe',
-  '3.6': '17486007770731_18360310237803_teme2zt4fm',
-  '4': '15255022345835_15283095800427_vwrupxzstm',
-  '4.1': '15255038074475_15283122080363_ai5qqp2we4',
-  '4.2': '15255045480043_15283135842923_tldl4bhmii',
-  '4.3': '15255208599147_15283449629291_abltofuc7m',
-  '4.4': '15255217708651_15283466603115_bojrrqtlmu',
-  '4.5': '15255227670123_15283486263915_jpntt54mve',
-  '5': '17135767461483_18625099401835_4gpytlxk4a',
-  '5.1': '15273713933931_15317494860395_avj47smmim',
-  '5.2': '15273722257003_15317510195819_6edjluvdqi',
-  '5.3': '15273739624043_15317541653099_ii4bxpvabe',
-  '5.4': '15273750175339_15317561707115_csel26ku5a',
-  '5.5': '15273760071275_15317579467371_cnewcj54me',
-  '5.6': '15273767935595_15317595851371_3q43tk7tvm',
-  '5.7': '15273778683499_15317616560747_4piekvs4wu',
-  's1.1': '14204232736303_14846150314543_37jq4ryehq',
-  's1.2': '14204288179759_14846247373359_tnsknmapva',
-  's1.3': '14204319768111_14846302489135_sr4ht4ccwq',
-  's1.4': '14204331957807_14846326147631_dji2acqcze',
-  's1.5': '14204346572335_14846351641135_7gvns4o5ue',
-  's1.6': '14204361252399_14846376479279_cjajhf4d3y',
-  's1.7': '14204370492975_14846393649711_6fduhdqite',
-  's1.8': '14204395527727_14846438017583_s2jlti7lsm',
-  's1.9': '14204411387439_14846464887343_f5lxgcqj5y',
-  's1.10': '14204424691247_14846487562799_xmbvntt6wa',
-  's2.1': '14204490948143_14846603495983_kzevn36tii',
-  's2.2': '14204506742319_14846634494511_ta2rxyg2oy',
-  's2.3': '14204523322927_14846661233199_foqb3q7zb4',
-  's2.4': '14204540034607_14846689085999_gjejdie4uy',
-  's2.5': '14204555304495_14846715497007_zdanghuxzu',
-  's2.6': '14204565200431_14846734371375_ap3bqpabpu',
-  's2.7': '14204577259055_14846756194863_3ecad2535u',
-  's2.8': '14204592528943_14846785227311_4hjl46y62e',
-  's2.9': '14204602621487_14846802594351_ilnp6lxekq',
-  's2.10': '14206184136239_14849618610735_ihnbx7hkoi',
-});
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn, execSync } = require('child_process');
+const { OBSWebSocket } = require('obs-websocket-js');
 
-const SERVER = 'rtmp://vsu.okcdn.ru/input/';
+// ============================================================
+// GLOBAL CRASH SHIELD
+// ============================================================
+process.on('uncaughtException', (err) =>
+    console.error('[CRASH] UNCAUGHT EXCEPTION:', err.message)
+);
+process.on('unhandledRejection', (reason) =>
+    console.error('[CRASH] UNHANDLED REJECTION:', reason)
+);
 
-const PROFILES = Object.freeze({
-  '360p': [640, 360, 800],
-  '480p': [854, 480, 1500],
-  '720p': [1280, 720, 3000],
-  '1080p': [1920, 1080, 5000],
-});
+const obs = new OBSWebSocket();
 
-const sleep = (ms) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+// ============================================================
+// CONFIGURATION
+// ============================================================
+const selectedQuality = process.env.STREAM_QUALITY || '720p';
+const SERVER_SELECTION = (process.env.SERVER_SELECTION || 'None').trim();
+const PROXY_ENGINE = process.env.PROXY_ENGINE || 'Disabled';
+const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
+const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
 
-const log = (level, message, details = {}) =>
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level,
-    message,
-    ...details,
-  }));
+const FORCE_REFRESH_MS = 900000000 * 60 * 1000;
 
-function parseDuration(text) {
-  const raw = String(text || '60m').trim().toLowerCase();
+const NO_REFRESH_DOMAINS = (
+    process.env.NO_REFRESH_DOMAINS || ''
+).split(',').map(x => x.trim()).filter(Boolean);
 
-  if (['24/7', 'forever', 'infinite'].includes(raw)) {
-    return null;
-  }
+let RES_W = 1280;
+let RES_H = 720;
+let BITRATE = 3000;
 
-  if (/^\d+(?:\.\d+)?$/.test(raw)) {
-    return Number(raw) * 60000;
-  }
-
-  let total = 0;
-  let count = 0;
-
-  const unmatched = raw.replace(
-    /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|min|m|seconds?|secs?|s)/g,
-    (_, quantity, unit) => {
-      count++;
-      total += Number(quantity) *
-        (/^h/.test(unit) ? 3600000 :
-          /^m/.test(unit) ? 60000 : 1000);
-      return ' ';
-    }
-  );
-
-  if (
-    unmatched.trim() ||
-    !count ||
-    !Number.isFinite(total) ||
-    total <= 0
-  ) {
-    throw new Error(
-      'CUSTOM_DURATION invalid; use 30m, 1h 10m, 24/7'
-    );
-  }
-
-  return Math.round(total);
+if (selectedQuality === '360p') {
+    RES_W = 640; RES_H = 360; BITRATE = 800;
+} else if (selectedQuality === '480p') {
+    RES_W = 854; RES_H = 480; BITRATE = 1500;
+} else if (selectedQuality === '720p') {
+    RES_W = 1280; RES_H = 720; BITRATE = 3000;
+} else if (selectedQuality.includes('1080p')) {
+    RES_W = 1920; RES_H = 1080; BITRATE = 4500;
 }
 
-function config() {
-  const urls = String(
-    process.env.TARGET_URLS || process.env.TARGET_URL || ''
-  )
-    .split(/[|,\r\n]+/)
-    .map(x => x.trim().split('::')[0].trim())
-    .filter(Boolean);
+// ============================================================
+// STREAM KEYS — INSERT YOUR OWN KEYS
+// ============================================================
+// Never commit real keys to a public repository.
+// Alternatively, supply OKRU_STREAM_KEY as an environment secret.
 
-  if (!urls.length || urls.length > 10) {
-    throw new Error('Provide 1–10 normal webpage URLs');
-  }
+const STREAM_KEYS = {
+    '1'    : '',
+    '1.1'  : '',
+    '1.2'  : '',
+    '1.3'  : '',
+    '1.4'  : '',
+    '1.5'  : '',
+    '1.6'  : '',
+    '1.7'  : '',
+    '1.8'  : '',
+    '1.9'  : '',
+    '1.10' : '',
+    '1.11' : '',
+    '2'    : '',
+    '2.1'  : '',
+    '2.2'  : '',
+    '3'    : '',
+    '3.1'  : '',
+    '3.2'  : '',
+    '3.3'  : '',
+    '3.4'  : '',
+    '3.5'  : '',
+    '3.6'  : '',
+    '4'    : '',
+    '4.1'  : '',
+    '4.2'  : '',
+    '4.3'  : '',
+    '4.4'  : '',
+    '4.5'  : '',
+    '5'    : '17135767461483_18625099401835_4gpytlxk4a',
+    '5.1'  : '15273713933931_15317494860395_avj47smmim',
+    '5.2'  : '',
+    '5.3'  : '',
+    '5.4'  : '',
+    '5.5'  : '',
+    '5.6'  : '',
+    '5.7'  : '',
+    's1.1' : '',
+    's1.2' : '',
+    's1.3' : '',
+    's1.4' : '',
+    's1.5' : '',
+    's1.6' : '',
+    's1.7' : '',
+    's1.8' : '',
+    's1.9' : '',
+    's1.10': '',
+    's2.1' : '',
+    's2.2' : '',
+    's2.3' : '',
+    's2.4' : '',
+    's2.5' : '',
+    's2.6' : '',
+    's2.7' : '',
+    's2.8' : '',
+    's2.9' : '',
+    's2.10': ''
+};
 
-  const hosts = urls.map((item, i) => {
-    let u;
+const ACTIVE_STREAM_KEY = String(
+    process.env.OKRU_STREAM_KEY ||
+    STREAM_KEYS[SELECTED_CHANNEL] ||
+    ''
+).trim();
+
+// ============================================================
+// MULTI-URL PARSER
+// ============================================================
+const rawUrls = (process.env.TARGET_URLS || '').trim();
+
+const urlList = rawUrls
+    .split(/[,|]/)
+    .map(u => {
+        let clean = u.split('::')[0].trim().replace(/^!/, '');
+        if (clean && !clean.startsWith('http')) {
+            clean = 'https://' + clean;
+        }
+        return clean;
+    })
+    .filter(u => u.length > 8);
+
+if (!urlList.length || !ACTIVE_STREAM_KEY) {
+    console.error(
+        '[CONFIG] Set TARGET_URLS (authorized player URL) ' +
+        'and OKRU_STREAM_KEY (your own destination key).'
+    );
+    process.exit(1);
+}
+
+let currentUrlIndex = 0;
+let browser = null;
+let page = null;
+let obsProcess = null;
+
+// ============================================================
+// MONITORING STATE
+// ============================================================
+let netStats = {
+    lastSegmentOkTime: Date.now(),
+    segmentErrorCount: 0,
+    lastHttpStatus: 200,
+    lastMediaSeq: null,
+    lastSeqAdvanceTime: Date.now(),
+    staleManifestCount: 0,
+    programDateTimeLagSec: 0,
+    seenManifest: false,
+    hlsPlaylists: new Map()
+};
+
+let visualStats = {
+    lastCheckTime: 0,
+    lastHash: null,
+    sameHashSince: Date.now(),
+    recentHashes: []
+};
+
+function resetMonitorStats() {
+    netStats = {
+        lastSegmentOkTime: Date.now(),
+        segmentErrorCount: 0,
+        lastHttpStatus: 200,
+        lastMediaSeq: null,
+        lastSeqAdvanceTime: Date.now(),
+        staleManifestCount: 0,
+        programDateTimeLagSec: 0,
+        seenManifest: false,
+        hlsPlaylists: new Map()
+    };
+
+    visualStats = {
+        lastCheckTime: 0,
+        lastHash: null,
+        sameHashSince: Date.now(),
+        recentHashes: []
+    };
+}
+
+console.log(
+    `[ENGINE] ${RES_W}x${RES_H} @ ${BITRATE}kbps | ` +
+    `Channel: ${SELECTED_CHANNEL}`
+);
+
+console.log(
+    `[URLS] Loaded ${urlList.length} authorized player URL(s).`
+);
+
+// ============================================================
+// OBS CONFIGURATION
+// ============================================================
+function setupOBSConfig() {
+    const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
+    const profilesDir = path.join(
+        obsDir, 'basic', 'profiles', 'Untitled'
+    );
+    const scenesDir = path.join(obsDir, 'basic', 'scenes');
+    const wsPluginDir = path.join(
+        obsDir, 'plugin_config', 'obs-websocket'
+    );
+
+    fs.mkdirSync(profilesDir, { recursive: true });
+    fs.mkdirSync(scenesDir, { recursive: true });
+    fs.mkdirSync(wsPluginDir, { recursive: true });
+
+    fs.writeFileSync(
+        path.join(obsDir, 'global.ini'),
+        `[General]\nLicenseAccepted=true\nFirstRun=true\n` +
+        `[BasicWindow]\nShowAutoConfig=false\nWarned=true\n` +
+        `[OBSWebSocket]\nServerEnabled=true\nServerPort=4455\nServerPassword=secret\n`
+    );
+
+    fs.writeFileSync(
+        path.join(wsPluginDir, 'config.json'),
+        JSON.stringify({
+            alerts_enabled: false,
+            auth_required: true,
+            first_load: false,
+            server_enabled: true,
+            server_password: 'secret',
+            server_port: 4455
+        }, null, 2)
+    );
+
+    fs.writeFileSync(
+        path.join(profilesDir, 'basic.ini'),
+        `[General]\nName=Untitled\n` +
+        `[Video]\nBaseCX=${RES_W}\nBaseCY=${RES_H}\n` +
+        `OutputCX=${RES_W}\nOutputCY=${RES_H}\nFPSCommon=30\n` +
+        `[Output]\nMode=Advanced\n` +
+        `[AdvOut]\nTrackIndex=1\nRecType=Standard\nEncoder=obs_x264\n` +
+        `[obs_x264]\nbitrate=${BITRATE}\nkeyint_sec=2\n` +
+        `preset=ultrafast\nprofile=main\ntune=zerolatency\n`
+    );
+
+    const serviceJson = {
+        settings: {
+            server: 'rtmp://vsu.okcdn.ru/input/',
+            key: ACTIVE_STREAM_KEY.trim()
+        },
+        type: 'rtmp_custom'
+    };
+
+    fs.writeFileSync(
+        path.join(profilesDir, 'service.json'),
+        JSON.stringify(serviceJson, null, 2)
+    );
+
+    const sceneJson = {
+        current_scene: 'MainScene',
+        current_program_scene: 'MainScene',
+        name: 'Untitled',
+        scene_order: [
+            { name: 'WaitingScene' },
+            { name: 'MainScene' }
+        ],
+        sources: [
+            {
+                id: 'xshm_input',
+                name: 'Screen',
+                settings: { show_cursor: false }
+            },
+            {
+                id: 'pulse_output_capture',
+                name: 'Audio',
+                settings: {}
+            },
+            {
+                id: 'scene',
+                name: 'MainScene',
+                settings: {
+                    items: [
+                        { name: 'Screen', id: 1, visible: true },
+                        { name: 'Audio', id: 2, visible: true }
+                    ]
+                }
+            },
+            {
+                id: 'scene',
+                name: 'WaitingScene',
+                settings: {
+                    items: [
+                        { name: 'Screen', id: 1, visible: true }
+                    ]
+                }
+            }
+        ]
+    };
+
+    fs.writeFileSync(
+        path.join(scenesDir, 'Untitled.json'),
+        JSON.stringify(sceneJson, null, 2)
+    );
+}
+
+// ============================================================
+// X11 WINDOW MANAGEMENT
+// ============================================================
+function keepChromeOnTopAndHideOBS() {
+    try {
+        execSync(
+            'xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true',
+            { stdio: 'ignore' }
+        );
+        execSync(
+            `xdotool search --onlyvisible --class "chrome" ` +
+            `windowmove 0 0 windowsize ${RES_W} ${RES_H} ` +
+            `windowactivate || true`,
+            { stdio: 'ignore' }
+        );
+        execSync(
+            'wmctrl -a "Chrome" || true',
+            { stdio: 'ignore' }
+        );
+    } catch (e) {}
+}
+
+// ============================================================
+// HLS PER-PLAYLIST MEDIA SEQUENCE MONITOR
+// ============================================================
+// Advisory only: manifests do not identify the rendition
+// actually being decoded by the player.
+
+function recordHlsManifest(
+    rawUrl,
+    body,
+    stats = netStats,
+    now = Date.now()
+) {
+    if (typeof body !== 'string') return;
+
+    const lines = body
+        .replace(/^\uFEFF/, '')
+        .split(/\r?\n/)
+        .map(x => x.trim());
+
+    if (lines[0] !== '#EXTM3U') return;
+
+    // Master playlists do not have EXT-X-TARGETDURATION.
+    const targetLine = lines.find(x =>
+        /^#EXT-X-TARGETDURATION:\d+\s*$/.test(x)
+    );
+
+    if (!targetLine) return;
+
+    let playlistUrl;
 
     try {
-      u = new URL(item);
+        const u = new URL(rawUrl);
+        u.hash = '';
+
+        // Remove LL-HLS delivery directives but keep rendition
+        // and other playlist-identifying query parameters.
+        for (const p of [
+            '_HLS_msn',
+            '_HLS_part',
+            '_HLS_skip'
+        ]) {
+            u.searchParams.delete(p);
+        }
+
+        u.searchParams.sort();
+        playlistUrl = u.toString();
     } catch {
-      throw new Error(`Webpage URL ${i + 1} is invalid`);
+        return;
     }
 
-    if (!['http:', 'https:'].includes(u.protocol)) {
-      throw new Error(
-        `Webpage URL ${i + 1} must use http(s)`
-      );
+    // Finished playlists do not need to advance.
+    if (
+        lines.includes('#EXT-X-ENDLIST') ||
+        lines.includes('#EXT-X-PLAYLIST-TYPE:VOD')
+    ) {
+        stats.hlsPlaylists.delete(playlistUrl);
+        return;
     }
 
-    return u.hostname;
-  });
+    const sequenceLine = lines.find(x =>
+        /^#EXT-X-MEDIA-SEQUENCE:\d+\s*$/.test(x)
+    );
 
-  const channel = String(
-    process.env.OKRU_STREAM_ID || '1'
-  ).trim();
+    const sequence = sequenceLine
+        ? Number(sequenceLine.split(':')[1])
+        : 0;
 
-  if (!Object.hasOwn(STREAM_KEYS, channel)) {
-    throw new Error(`Unknown OKRU_STREAM_ID: ${channel}`);
-  }
+    const targetDurationSec = Number(
+        targetLine.split(':')[1]
+    );
 
-  const quality = String(
-    process.env.STREAM_QUALITY || '720p'
-  ).trim();
-
-  if (!Object.hasOwn(PROFILES, quality)) {
-    throw new Error(`Unknown STREAM_QUALITY: ${quality}`);
-  }
-
-  const audio = String(
-    process.env.ENABLE_STREAM_AUDIO || 'ON'
-  ).toUpperCase();
-
-  if (!['ON', 'OFF'].includes(audio)) {
-    throw new Error('ENABLE_STREAM_AUDIO must be ON or OFF');
-  }
-
-  const proxyEngine = String(
-    process.env.PROXY_ENGINE || 'None'
-  );
-
-  if (!['None', 'Custom proxy'].includes(proxyEngine)) {
-    throw new Error('Unsupported PROXY_ENGINE');
-  }
-
-  let proxy = null;
-
-  if (proxyEngine === 'Custom proxy') {
-    const raw = (
-      process.env.BROWSER_PROXY_URL || ''
-    ).trim();
-
-    if (!raw) {
-      throw new Error(
-        'Custom proxy requires BROWSER_PROXY_URL repository secret'
-      );
+    if (
+        !Number.isSafeInteger(sequence) ||
+        !Number.isFinite(targetDurationSec) ||
+        targetDurationSec < 1
+    ) {
+        return;
     }
 
-    try {
-      proxy = new URL(raw);
-    } catch {
-      throw new Error(
-        'BROWSER_PROXY_URL must be a valid proxy URL'
-      );
+    let completedSegments = 0;
+    let trailingParts = 0;
+    let skippedSegments = 0;
+
+    for (const line of lines) {
+        if (line.startsWith('#EXTINF:')) {
+            completedSegments++;
+            trailingParts = 0;
+        } else if (line.startsWith('#EXT-X-PART:')) {
+            trailingParts++;
+        } else if (line.startsWith('#EXT-X-SKIP:')) {
+            const m = line.match(/SKIPPED-SEGMENTS=(\d+)/);
+
+            if (m) {
+                skippedSegments = Number(m[1]);
+            }
+        }
     }
 
     if (
-      !['http:', 'https:', 'socks5:'].includes(proxy.protocol)
+        completedSegments === 0 &&
+        trailingParts === 0
     ) {
-      throw new Error(
-        'Proxy must be HTTP(S) or SOCKS5'
-      );
+        return;
     }
 
-    if (proxy.username || proxy.password) {
-      throw new Error(
-        'This version supports unauthenticated proxies only'
-      );
-    }
-  }
+    // Next segment sequence at the end of the playlist.
+    // This recognizes EVENT and LL-HLS updates even when
+    // MEDIA-SEQUENCE itself remains unchanged.
+    const edge =
+        sequence + skippedSegments + completedSegments;
 
-  const wanted = parseDuration(
-    process.env.CUSTOM_DURATION || '60m'
-  );
+    if (!Number.isSafeInteger(edge)) return;
 
-  const durationMs = Math.min(
-    wanted === null ? 330 * 60000 : wanted,
-    330 * 60000
-  );
+    const previous = stats.hlsPlaylists.get(playlistUrl);
 
-  if (
-    !Number.isFinite(durationMs) ||
-    durationMs <= 0
-  ) {
-    throw new Error('Duration must be positive');
-  }
+    const progressed =
+        !previous ||
+        edge > previous.edge ||
+        (
+            edge === previous.edge &&
+            trailingParts > previous.trailingParts
+        ) ||
+        edge < previous.edge;
 
-  return {
-    urls,
-    hosts,
-    channel,
-    quality,
-    audio,
-    proxy,
+    stats.hlsPlaylists.delete(playlistUrl);
 
-    serverSelection: String(
-      process.env.SERVER_SELECTION || 'None'
-    ).trim(),
-
-    durationMs,
-
-    output: SERVER + STREAM_KEYS[channel],
-  };
-}
-
-function displayName(value) {
-  return value.includes('.')
-    ? `${value}+0,0`
-    : `${value}.0+0,0`;
-}
-
-function encoderArgs(cfg) {
-  const [w, h, rate] = PROFILES[cfg.quality];
-
-  const args = [
-    '-hide_banner',
-    '-nostdin',
-    '-loglevel', 'warning',
-    '-stats_period', '4',
-    '-progress', 'pipe:3',
-
-    '-thread_queue_size', '512',
-    '-f', 'x11grab',
-    '-framerate', '30',
-    '-video_size', `${w}x${h}`,
-    '-i', displayName(process.env.DISPLAY),
-  ];
-
-  if (cfg.audio === 'ON') {
-    args.push(
-      '-thread_queue_size', '512',
-      '-f', 'pulse',
-      '-i', 'stream_sink.monitor'
-    );
-  } else {
-    args.push(
-      '-f', 'lavfi',
-      '-i',
-      'anullsrc=channel_layout=stereo:sample_rate=48000'
-    );
-  }
-
-  args.push(
-    '-map', '0:v:0',
-    '-map', '1:a:0',
-
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-tune', 'zerolatency',
-
-    '-pix_fmt', 'yuv420p',
-    '-b:v', `${rate}k`,
-    '-maxrate', `${rate}k`,
-    '-bufsize', `${rate * 2}k`,
-
-    '-g', '60',
-    '-keyint_min', '60',
-    '-sc_threshold', '0',
-
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-ar', '48000',
-    '-ac', '2',
-
-    '-f', 'flv',
-    cfg.output
-  );
-
-  return args;
-}
-
-function startEncoder(cfg, signal) {
-  const child = spawn('ffmpeg', encoderArgs(cfg), {
-    stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
-  });
-
-  let lastAdvance = Date.now();
-  let lastFrames = -1;
-  let lastPts = -1;
-  let progressText = '';
-  let progress = {};
-  let stderr = '';
-  let stopped = false;
-  let resultResolved = false;
-  let resolveExit;
-
-  const exited = new Promise(resolve => {
-    resolveExit = resolve;
-  });
-
-  const finish = (detail) => {
-    if (resultResolved) return;
-
-    resultResolved = true;
-    clearInterval(watcher);
-    signal.removeEventListener('abort', stop);
-    resolveExit(detail);
-  };
-
-  function stop() {
-    if (stopped) return;
-
-    stopped = true;
-    child.kill('SIGTERM');
-
-    const force = setTimeout(
-      () => child.kill('SIGKILL'),
-      5000
-    );
-
-    force.unref();
-  }
-
-  child.once('error', e =>
-    finish({ error: e.code || e.message })
-  );
-
-  child.once('close', (code, sig) => {
-    finish({
-      code,
-      signal: sig,
-
-      cause:
-        /Connection refused|broken pipe|Input\/output error/i
-          .test(stderr)
-          ? 'RTMP connection error'
-          : 'Encoder ended'
+    stats.hlsPlaylists.set(playlistUrl, {
+        edge,
+        trailingParts,
+        targetMs: targetDurationSec * 1000,
+        lastSeenAt: now,
+        lastProgressAt: progressed
+            ? now
+            : previous.lastProgressAt,
+        samples:
+            previous && edge >= previous.edge
+                ? previous.samples + 1
+                : 1
     });
-  });
 
-  signal.addEventListener('abort', stop, {
-    once: true
-  });
-
-  child.stdio[3].on('data', bytes => {
-    progressText += bytes.toString('utf8');
-
-    if (progressText.length > 100000) {
-      progressText = progressText.slice(-10000);
+    // Bound memory use for long-running sessions.
+    while (stats.hlsPlaylists.size > 48) {
+        stats.hlsPlaylists.delete(
+            stats.hlsPlaylists.keys().next().value
+        );
     }
 
-    let idx;
+    stats.seenManifest = true;
 
-    while (
-      (idx = progressText.indexOf('\n')) >= 0
-    ) {
-      const line = progressText
-        .slice(0, idx)
-        .trim();
+    // Informational only. Never compare global sequence
+    // values belonging to different playlists.
+    stats.lastMediaSeq = sequence;
 
-      progressText = progressText.slice(idx + 1);
-
-      const sep = line.indexOf('=');
-
-      if (sep < 1) continue;
-
-      progress[line.slice(0, sep)] =
-        line.slice(sep + 1);
-
-      if (!line.startsWith('progress=')) {
-        continue;
-      }
-
-      const f = Number(progress.frame);
-
-      const pts = Number(
-        progress.out_time_us ??
-        progress.out_time_ms
-      );
-
-      if (
-        (Number.isFinite(f) && f > lastFrames) ||
-        (Number.isFinite(pts) && pts > lastPts)
-      ) {
-        lastAdvance = Date.now();
-      }
-
-      if (Number.isFinite(f)) {
-        lastFrames = Math.max(f, lastFrames);
-      }
-
-      if (Number.isFinite(pts)) {
-        lastPts = Math.max(pts, lastPts);
-      }
-
-      progress = {};
+    if (progressed) {
+        stats.lastSeqAdvanceTime = now;
     }
-  });
 
-  child.stderr.on('data', bytes => {
-    stderr = (
-      stderr + bytes.toString('utf8')
-    ).slice(-5000);
-  });
+    // Preserve Program-Date-Time telemetry.
+    const pdtLine = lines
+        .filter(x =>
+            x.startsWith('#EXT-X-PROGRAM-DATE-TIME:')
+        )
+        .at(-1);
 
-  const watcher = setInterval(() => {
-    if (
-      !stopped &&
-      Date.now() - lastAdvance > 45000
-    ) {
-      log(
-        'warn',
-        'FFmpeg output not advancing; restarting'
-      );
-
-      stop();
-    }
-  }, 5000);
-
-  return { exited, stop };
-}
-
-async function mediaSample(page, unmute) {
-  const readings = await Promise.all(
-    page.frames().map(
-      frame => frame.evaluate((hasAudio) => {
-        const videos = [
-          ...document.querySelectorAll('video')
-        ];
-
-        if (!videos.length) return null;
-
-        videos.sort(
-          (a, b) =>
-            (b.clientWidth * b.clientHeight) -
-            (a.clientWidth * a.clientHeight)
+    if (pdtLine) {
+        const pdt = Date.parse(
+            pdtLine.slice(
+                '#EXT-X-PROGRAM-DATE-TIME:'.length
+            )
         );
 
-        const v = videos[0];
+        if (Number.isFinite(pdt)) {
+            stats.programDateTimeLagSec = Math.round(
+                (now - pdt) / 1000
+            );
+        }
+    }
+}
 
-        v.muted = !hasAudio;
+function getHlsManifestState(now = Date.now()) {
+    const recentlyPolled = [
+        ...netStats.hlsPlaylists.values()
+    ].filter(item =>
+        item.samples >= 2 &&
+        now - item.lastSeenAt <=
+            Math.max(30000, 3 * item.targetMs)
+    );
 
-        if (hasAudio) {
-          v.volume = 1;
+    if (!recentlyPolled.length) {
+        return 'HLS_UNKNOWN';
+    }
+
+    // If ANY recently polled live rendition advanced,
+    // avoid reporting a global stale-manifest failure.
+    const hasRecentProgress = recentlyPolled.some(item =>
+        now - item.lastProgressAt <=
+            Math.max(25000, 4 * item.targetMs)
+    );
+
+    return hasRecentProgress
+        ? 'OK'
+        : 'STALE_MANIFEST_SUSPECT';
+}
+
+// ============================================================
+// PAGE NETWORK RESPONSE MONITORING
+// ============================================================
+async function setupPageProtections(p) {
+    try {
+        p.on('response', async (res) => {
+            try {
+                const url = res.url().toLowerCase();
+                const status = res.status();
+
+                const isManifest =
+                    url.includes('.m3u8') ||
+                    url.includes('.mpd');
+
+                const isSegment =
+                    url.includes('.ts') ||
+                    url.includes('.m4s') ||
+                    url.includes('.aac') ||
+                    url.includes('.mp4');
+
+                if (isManifest || isSegment) {
+                    netStats.lastHttpStatus = status;
+
+                    if (status >= 200 && status < 400) {
+                        netStats.lastSegmentOkTime =
+                            Date.now();
+                        netStats.segmentErrorCount = 0;
+                    } else if (status >= 400) {
+                        netStats.segmentErrorCount++;
+                    }
+                }
+
+                // 304 responses have no body to parse.
+                if (
+                    url.includes('.m3u8') &&
+                    status === 200
+                ) {
+                    const sessionStats = netStats;
+
+                    const body = await res.text()
+                        .catch(() => '');
+
+                    // Ignore responses belonging to a previous
+                    // monitoring session after URL failover.
+                    if (
+                        sessionStats === netStats &&
+                        body
+                    ) {
+                        recordHlsManifest(
+                            res.url(),
+                            body,
+                            sessionStats
+                        );
+                    }
+                }
+            } catch (e) {}
+        });
+
+        p.on('requestfailed', (req) => {
+            const url = req.url().toLowerCase();
+
+            if (
+                url.includes('.m3u8') ||
+                url.includes('.ts') ||
+                url.includes('.m4s')
+            ) {
+                netStats.segmentErrorCount++;
+            }
+        });
+
+        await p.evaluateOnNewDocument(() => {
+            const style = document.createElement('style');
+
+            style.textContent =
+                'html, body {' +
+                'background-color:#000 !important;' +
+                'overflow:hidden !important;' +
+                'margin:0 !important;' +
+                '}';
+
+            if (document.documentElement) {
+                document.documentElement.appendChild(style);
+            }
+        });
+    } catch (e) {}
+}
+
+// ============================================================
+// LOADING OVERLAY
+// ============================================================
+async function showLoadingOverlay(p, title, subtitle) {
+    try {
+        await p.evaluate((t, s) => {
+            if (window.self !== window.top) return;
+
+            let el = document.getElementById(
+                'bot-loading-ui'
+            );
+
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'bot-loading-ui';
+
+                el.style.cssText =
+                    'position:fixed;' +
+                    'inset:0;' +
+                    'width:100vw;' +
+                    'height:100vh;' +
+                    'background:#000;' +
+                    'z-index:2147483647;' +
+                    'display:flex;' +
+                    'flex-direction:column;' +
+                    'justify-content:center;' +
+                    'align-items:center;' +
+                    'color:#fff;' +
+                    'font-family:sans-serif;';
+
+                document.documentElement.appendChild(el);
+            }
+
+            el.innerHTML =
+                `<h1 style="font-size:38px;margin-bottom:10px;color:#e50914;">${t}</h1>` +
+                `<p style="font-size:20px;color:#aaa;">${s}</p>`;
+        }, title, subtitle);
+    } catch (e) {}
+}
+
+async function hideLoadingOverlay(p) {
+    try {
+        await p.evaluate(() => {
+            const el = document.getElementById(
+                'bot-loading-ui'
+            );
+            if (el) el.remove();
+        });
+    } catch (e) {}
+}
+
+// ============================================================
+// VIDEO PLAYER AUTO-PLAY AND FULLSCREEN
+// ============================================================
+async function lockAndPlayVideo(p) {
+    if (!p) return;
+
+    try {
+        if (SERVER_SELECTION !== 'None') {
+            await p.evaluate((srv) => {
+                const btn = Array.from(
+                    document.querySelectorAll('button, a, div')
+                ).find(b =>
+                    b.innerText &&
+                    b.innerText.trim().includes(srv)
+                );
+
+                if (btn) btn.click();
+            }, SERVER_SELECTION).catch(() => {});
+
+            await new Promise(r =>
+                setTimeout(r, 2000)
+            );
         }
 
-        if (v.paused) {
-          v.play().catch(() => {});
+        for (let attempt = 0; attempt < 8; attempt++) {
+            let playing = false;
+
+            for (const frame of p.frames()) {
+                if (frame.isDetached()) continue;
+
+                try {
+                    const status = await frame.evaluate(
+                        (audioEnabled) => {
+                            const selectors =
+                                '.jw-icon-display, ' +
+                                '.jw-icon-playback, ' +
+                                '.jw-icon-live, ' +
+                                'button[data-plyr="play"], ' +
+                                '.vjs-big-play-button, ' +
+                                '.vjs-play-control, ' +
+                                '.vjs-live-control, ' +
+                                '[class*="unmute"], ' +
+                                '.fp-play, ' +
+                                '.clappr-player, video';
+
+                            document.querySelectorAll(
+                                selectors
+                            ).forEach(el => {
+                                try { el.click(); }
+                                catch (e) {}
+                            });
+
+                            let isPlaying = false;
+
+                            document.querySelectorAll(
+                                'video'
+                            ).forEach(v => {
+                                if (v.paused) {
+                                    v.play().catch(() => {});
+                                }
+
+                                v.muted = !audioEnabled;
+                                v.volume = audioEnabled
+                                    ? 1.0 : 0.0;
+
+                                if (
+                                    !v.paused &&
+                                    v.readyState >= 2
+                                ) {
+                                    isPlaying = true;
+                                }
+                            });
+
+                            return isPlaying;
+                        },
+                        ENABLE_STREAM_AUDIO
+                    );
+
+                    if (status) {
+                        playing = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+
+            if (playing) break;
+
+            await new Promise(r =>
+                setTimeout(r, 1500)
+            );
         }
 
-        const n =
-          v.getVideoPlaybackQuality?.().totalVideoFrames;
+        for (const frame of p.frames()) {
+            if (frame.isDetached()) continue;
+
+            await frame.evaluate((audioEnabled) => {
+                if (window.__frameLockActive) return;
+
+                window.__frameLockActive = true;
+
+                setInterval(() => {
+                    document.documentElement.style
+                        .setProperty(
+                            'background',
+                            '#000',
+                            'important'
+                        );
+
+                    if (document.body) {
+                        document.body.style.setProperty(
+                            'background',
+                            '#000',
+                            'important'
+                        );
+                    }
+
+                    const v =
+                        document.querySelector('video');
+
+                    if (v) {
+                        if (v.paused) {
+                            v.play().catch(() => {});
+
+                            const resumeSelectors =
+                                '.jw-icon-display, ' +
+                                '.jw-icon-playback, ' +
+                                'button[data-plyr="play"], ' +
+                                '.vjs-play-control, ' +
+                                '.vjs-big-play-button, ' +
+                                '.fp-play';
+
+                            document.querySelectorAll(
+                                resumeSelectors
+                            ).forEach(btn => {
+                                try { btn.click(); }
+                                catch (e) {}
+                            });
+                        }
+
+                        const liveBtns =
+                            document.querySelectorAll(
+                                '.jw-icon-live, ' +
+                                '.vjs-live-control, ' +
+                                '[class*="live-button"], ' +
+                                '[aria-label*="Live"]'
+                            );
+
+                        liveBtns.forEach(btn => {
+                            const cls = (
+                                btn.className || ''
+                            ).toString().toLowerCase();
+
+                            if (
+                                cls.includes('not-live') ||
+                                cls.includes('behind') ||
+                                cls.includes('dvr')
+                            ) {
+                                try { btn.click(); }
+                                catch (e) {}
+                            }
+                        });
+
+                        if (
+                            v.clientWidth > 50 ||
+                            !v.paused
+                        ) {
+                            v.muted = !audioEnabled;
+                            v.volume = audioEnabled
+                                ? 1.0 : 0.0;
+
+                            const wrap = v.closest(
+                                '.jwplayer, #player, ' +
+                                '.plyr, .vjs-player, ' +
+                                '[data-player], .player-poster'
+                            ) || v;
+
+                            wrap.style.cssText =
+                                'position:fixed !important;' +
+                                'top:0 !important;' +
+                                'left:0 !important;' +
+                                'width:100vw !important;' +
+                                'height:100vh !important;' +
+                                'z-index:2147483646 !important;' +
+                                'background:#000 !important;';
+
+                            v.style.cssText =
+                                'width:100% !important;' +
+                                'height:100% !important;' +
+                                'object-fit:contain !important;';
+
+                            document.querySelectorAll(
+                                '.jw-controls, ' +
+                                '.plyr__controls, ' +
+                                '.vjs-control-bar'
+                            ).forEach(c =>
+                                c.style.setProperty(
+                                    'display',
+                                    'none',
+                                    'important'
+                                )
+                            );
+
+                            return;
+                        }
+                    }
+
+                    const iframes = Array.from(
+                        document.querySelectorAll('iframe')
+                    );
+
+                    let best = null;
+                    let maxArea = 5000;
+
+                    iframes.forEach(f => {
+                        const area =
+                            f.clientWidth * f.clientHeight;
+
+                        if (
+                            area > maxArea &&
+                            f.clientWidth >= f.clientHeight
+                        ) {
+                            maxArea = area;
+                            best = f;
+                        }
+                    });
+
+                    if (best) {
+                        iframes.forEach(f => {
+                            if (f !== best) {
+                                f.style.setProperty(
+                                    'display',
+                                    'none',
+                                    'important'
+                                );
+                            }
+                        });
+
+                        best.style.cssText =
+                            'position:fixed !important;' +
+                            'top:0 !important;' +
+                            'left:0 !important;' +
+                            'width:100vw !important;' +
+                            'height:100vh !important;' +
+                            'z-index:2147483645 !important;' +
+                            'border:none !important;' +
+                            'background:#000 !important;' +
+                            'display:block !important;' +
+                            'visibility:visible !important;';
+                    }
+                }, 1000);
+            }, ENABLE_STREAM_AUDIO).catch(() => {});
+        }
+    } catch (e) {}
+}
+
+// ============================================================
+// VISUAL FRAME FRESHNESS
+// ============================================================
+async function checkVisualFreshness(p) {
+    const now = Date.now();
+
+    if (
+        now - visualStats.lastCheckTime < 6000
+    ) {
+        return { visualStatus: 'OK' };
+    }
+
+    visualStats.lastCheckTime = now;
+
+    try {
+        const buf = await p.screenshot({
+            type: 'jpeg',
+            quality: 25,
+            clip: {
+                x: Math.floor(RES_W * 0.15),
+                y: Math.floor(RES_H * 0.15),
+                width: Math.floor(RES_W * 0.7),
+                height: Math.floor(RES_H * 0.7)
+            }
+        });
+
+        const frameHash = crypto
+            .createHash('md5')
+            .update(buf)
+            .digest('hex')
+            .slice(0, 12);
+
+        if (visualStats.lastHash === frameHash) {
+            const frozenMs =
+                now - visualStats.sameHashSince;
+
+            if (frozenMs > 18000) {
+                return {
+                    visualStatus: 'VISUAL_FROZEN',
+                    frozenSec: Math.round(
+                        frozenMs / 1000
+                    ),
+                    hash: frameHash
+                };
+            }
+        } else {
+            visualStats.lastHash = frameHash;
+            visualStats.sameHashSince = now;
+
+            visualStats.recentHashes.push(frameHash);
+
+            if (visualStats.recentHashes.length > 18) {
+                visualStats.recentHashes.shift();
+            }
+
+            const occurrences =
+                visualStats.recentHashes.filter(
+                    h => h === frameHash
+                ).length;
+
+            if (occurrences >= 5) {
+                return {
+                    visualStatus: 'CONTENT_LOOP',
+                    hash: frameHash
+                };
+            }
+        }
 
         return {
-          time: Number(v.currentTime),
-
-          frames: Number.isFinite(n)
-            ? n
-            : null,
-
-          paused: v.paused,
-          ready: v.readyState,
-          width: v.videoWidth,
-          height: v.videoHeight
+            visualStatus: 'OK',
+            hash: frameHash
         };
-      }, unmute).catch(() => null)
-    )
-  );
-
-  return readings.find(
-    x => x && x.width > 0 && x.height > 0
-  ) || readings.find(Boolean) || null;
+    } catch (e) {
+        return { visualStatus: 'OK' };
+    }
 }
 
-async function chooseServer(page, label) {
-  if (
-    !label ||
-    label.toLowerCase() === 'none'
-  ) {
-    return;
-  }
+// ============================================================
+// PLAYBACK HEALTH
+// ============================================================
+async function checkStreamHealth(p) {
+    if (!p) return { status: 'DEAD' };
 
-  for (const frame of page.frames()) {
     try {
-      const clicked = await frame.evaluate(
-        (name) => {
-          const elems = [
-            ...document.querySelectorAll(
-              'button,a,[role="button"],input[type="button"]'
-            )
-          ];
+        const checks = p.frames().map(async (frame) => {
+            if (frame.isDetached()) return null;
 
-          const normalized = (s) =>
-            String(s || '')
-              .trim()
-              .toLowerCase();
+            try {
+                return await Promise.race([
+                    frame.evaluate(() => {
+                        const v =
+                            document.querySelector('video');
 
-          const match = elems.find(
-            el => normalized(
-              el.innerText ||
-              el.value ||
-              el.getAttribute('aria-label')
-            ) === normalized(name)
-          );
+                        if (!v) return null;
 
-          if (!match) return false;
+                        const frames =
+                            v.getVideoPlaybackQuality
+                                ? v.getVideoPlaybackQuality()
+                                    .totalVideoFrames
+                                : (v.webkitDecodedFrameCount || 0);
 
-          match.click();
+                        if (v.paused) {
+                            v.play().catch(() => {});
 
-          return true;
-        },
-        label
-      );
+                            const btns =
+                                document.querySelectorAll(
+                                    '.jw-icon-display, ' +
+                                    '.jw-icon-live, ' +
+                                    '.vjs-play-control, ' +
+                                    '.vjs-live-control, ' +
+                                    'button[data-plyr="play"]'
+                                );
 
-      if (clicked) {
-        log(
-          'info',
-          'Requested server button clicked',
-          { button: label }
+                            btns.forEach(b => {
+                                try { b.click(); }
+                                catch (e) {}
+                            });
+
+                            return {
+                                status: 'PAUSED_RESUMING',
+                                paused: true,
+                                readyState: v.readyState,
+                                currentTime: v.currentTime,
+                                frames
+                            };
+                        }
+
+                        if (
+                            v.readyState >= 2 ||
+                            frames > 0
+                        ) {
+                            return {
+                                status: 'HEALTHY',
+                                paused: false,
+                                readyState: v.readyState,
+                                currentTime: v.currentTime,
+                                frames
+                            };
+                        }
+
+                        return null;
+                    }),
+                    new Promise(r =>
+                        setTimeout(() => r(null), 1500)
+                    )
+                ]);
+            } catch (e) {
+                return null;
+            }
+        });
+
+        const results = await Promise.all(checks);
+
+        const healthy = results.find(
+            r => r && r.status === 'HEALTHY'
         );
 
-        await sleep(2000);
-        return;
-      }
-    } catch {
-      // Frame may have detached.
-    }
-  }
+        if (healthy) return healthy;
 
-  log(
-    'warn',
-    'No matching server button found; leaving the webpage unchanged'
-  );
+        const pausedStream = results.find(
+            r => r && r.status === 'PAUSED_RESUMING'
+        );
+
+        if (pausedStream) return pausedStream;
+
+        return { status: 'LOADING_OR_DEAD' };
+    } catch (e) {
+        return { status: 'DEAD' };
+    }
 }
 
-async function maximizeVideo(page) {
-  for (const frame of page.frames()) {
-    try {
-      await frame.evaluate(() => {
-        const v = [
-          ...document.querySelectorAll('video')
-        ].sort(
-          (a, b) =>
-            (b.clientWidth * b.clientHeight) -
-            (a.clientWidth * a.clientHeight)
-        )[0];
+// ============================================================
+// LOAD CURRENT URL
+// ============================================================
+async function loadCurrentUrl(reason) {
+    const targetUrl = urlList[currentUrlIndex];
 
-        if (!v) return;
-
-        const style =
-          document.getElementById('relay-css') ||
-          document.createElement('style');
-
-        style.id = 'relay-css';
-
-        style.textContent =
-          'html,body{margin:0!important;background:#000!important;overflow:hidden!important;}';
-
-        (
-          document.head ||
-          document.documentElement
-        ).appendChild(style);
-
-        v.style.cssText =
-          'position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:contain!important;z-index:2147483000!important;';
-      });
-    } catch {
-      // Iframe may be navigating.
-    }
-  }
-
-  await page.evaluate(() => {
-    const items = [
-      ...document.querySelectorAll('iframe')
-    ].filter(
-      x =>
-        x.clientWidth > 100 &&
-        x.clientHeight > 70
+    console.log(
+        `\n[RELOAD] ${reason} -> URL ` +
+        `[${currentUrlIndex + 1}/${urlList.length}]`
     );
 
-    if (items.length === 1) {
-      items[0].style.cssText =
-        'position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;border:0!important;z-index:2147482999!important;';
-    }
-  }).catch(() => {});
-}
-
-async function openSource(
-  page,
-  cfg,
-  preferredIndex,
-  signal
-) {
-  for (
-    let attempt = 0;
-    attempt < cfg.urls.length;
-    attempt++
-  ) {
-    if (signal.aborted) return -1;
-
-    const index =
-      (preferredIndex + attempt) %
-      cfg.urls.length;
-
-    log('info', 'Opening authorized webpage', {
-      sourceIndex: index + 1,
-      host: cfg.hosts[index]
-    });
+    resetMonitorStats();
 
     try {
-      await page.goto(cfg.urls[index], {
-        waitUntil: 'domcontentloaded',
-        timeout: 45000
-      });
+        await obs.call('SetCurrentProgramScene', {
+            sceneName: 'WaitingScene'
+        });
+    } catch (e) {}
 
-      await chooseServer(
-        page,
-        cfg.serverSelection
-      );
+    try {
+        await page.goto('about:blank');
+        await page.bringToFront();
 
-      const deadline =
-        Date.now() + 25000;
+        keepChromeOnTopAndHideOBS();
 
-      while (
-        Date.now() < deadline &&
-        !signal.aborted
-      ) {
-        const sample = await mediaSample(
-          page,
-          cfg.audio === 'ON'
+        await showLoadingOverlay(
+            page,
+            'CONNECTING STREAM',
+            `Server ${currentUrlIndex + 1} of ${urlList.length}`
         );
+
+        await page.goto(targetUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000
+        });
+
+        await showLoadingOverlay(
+            page,
+            'OPTIMIZING PLAYER',
+            'Locking fullscreen video...'
+        );
+
+        await lockAndPlayVideo(page);
+        await hideLoadingOverlay(page);
+
+        keepChromeOnTopAndHideOBS();
+    } catch (e) {
+        console.log(
+            `[WARNING] Page navigation: ${e.message}`
+        );
+    }
+
+    try {
+        await obs.call('SetCurrentProgramScene', {
+            sceneName: 'MainScene'
+        });
+    } catch (e) {}
+}
+
+// ============================================================
+// COMBINED WATCHDOG
+// ============================================================
+async function startWatchdog() {
+    let lastTime = -1;
+    let lastFrames = -1;
+    let lastWallClock = Date.now();
+
+    let freezeStart = Date.now();
+    let urlStart = Date.now();
+
+    let deadStrikes = 0;
+    let ticks = 0;
+
+    while (true) {
+        if (!browser || !browser.isConnected()) {
+            throw new Error('Browser disconnected');
+        }
+
+        keepChromeOnTopAndHideOBS();
+
+        const currentUrl = urlList[currentUrlIndex];
+        const health = await checkStreamHealth(page);
+
+        // Per-playlist monitoring is diagnostic.
+        // A stale manifest alone MUST NOT trigger failover.
+        let networkState = getHlsManifestState();
+
+        if (netStats.segmentErrorCount >= 6) {
+            networkState =
+                `NET_ERROR_${netStats.lastHttpStatus}`;
+        }
 
         if (
-          sample &&
-          sample.width > 0 &&
-          sample.height > 0
+            health.status === 'HEALTHY' ||
+            health.status === 'PAUSED_RESUMING'
         ) {
-          await maximizeVideo(page);
-          return index;
+            deadStrikes = 0;
+
+            if (health.status === 'PAUSED_RESUMING') {
+                console.log(
+                    '[PLAYBACK] Paused -> requesting resume'
+                );
+
+                await lockAndPlayVideo(page);
+            }
+
+            const now = Date.now();
+
+            const wallElapsed =
+                (now - lastWallClock) / 1000;
+
+            const timeDelta = lastTime !== -1
+                ? Math.abs(
+                    health.currentTime - lastTime
+                )
+                : wallElapsed;
+
+            const speedRatio = wallElapsed > 0
+                ? (timeDelta / wallElapsed).toFixed(2)
+                : '1.00';
+
+            lastWallClock = now;
+
+            const framesMoved =
+                lastFrames === -1 ||
+                health.frames !== lastFrames;
+
+            const timeMoved =
+                lastTime === -1 ||
+                health.currentTime !== lastTime;
+
+            const isMoving =
+                framesMoved || timeMoved;
+
+            const visualCheck =
+                await checkVisualFreshness(page);
+
+            if (!isMoving) {
+                if (
+                    Date.now() - freezeStart > 18000
+                ) {
+                    currentUrlIndex =
+                        (currentUrlIndex + 1) %
+                        urlList.length;
+
+                    await loadCurrentUrl(
+                        'PLAYBACK FROZEN (18s)'
+                    );
+
+                    freezeStart = Date.now();
+                    urlStart = Date.now();
+                    lastTime = -1;
+                    lastFrames = -1;
+
+                    continue;
+                }
+            } else if (
+                visualCheck.visualStatus ===
+                'VISUAL_FROZEN'
+            ) {
+                currentUrlIndex =
+                    (currentUrlIndex + 1) %
+                    urlList.length;
+
+                await loadCurrentUrl(
+                    `VISUAL SCREEN FROZEN ` +
+                    `(${visualCheck.frozenSec}s)`
+                );
+
+                freezeStart = Date.now();
+                urlStart = Date.now();
+                lastTime = -1;
+                lastFrames = -1;
+
+                continue;
+            } else if (
+                visualCheck.visualStatus ===
+                'CONTENT_LOOP'
+            ) {
+                currentUrlIndex =
+                    (currentUrlIndex + 1) %
+                    urlList.length;
+
+                await loadCurrentUrl(
+                    'REPEATING VISUAL LOOP DETECTED'
+                );
+
+                freezeStart = Date.now();
+                urlStart = Date.now();
+                lastTime = -1;
+                lastFrames = -1;
+
+                continue;
+            } else {
+                // Playback is progressing.
+                // Network warnings are advisory.
+                lastTime = health.currentTime;
+                lastFrames = health.frames;
+                freezeStart = Date.now();
+
+                await hideLoadingOverlay(page);
+            }
+
+            const isExempt =
+                NO_REFRESH_DOMAINS.some(
+                    d => currentUrl.includes(d)
+                );
+
+            if (
+                !isExempt &&
+                Date.now() - urlStart > FORCE_REFRESH_MS
+            ) {
+                await loadCurrentUrl(
+                    'SCHEDULED REFRESH'
+                );
+
+                freezeStart = Date.now();
+                urlStart = Date.now();
+                lastTime = -1;
+                lastFrames = -1;
+            }
+
+            ticks++;
+
+            if (
+                ticks === 1 ||
+                ticks % 10 === 0
+            ) {
+                console.log(
+                    `[HEALTH] Net:${networkState} ` +
+                    `(HTTP:${netStats.lastHttpStatus}, ` +
+                    `Playlists:${netStats.hlsPlaylists.size}) | ` +
+                    `Playback:${health.status} ` +
+                    `(Speed:${speedRatio}x, ` +
+                    `Time:${
+                        health.currentTime !== undefined
+                            ? health.currentTime.toFixed(1) + 's'
+                            : 'N/A'
+                    }, Frames:${health.frames ?? 'N/A'}) | ` +
+                    `Visual:${visualCheck.visualStatus} | ` +
+                    `URL [${currentUrlIndex + 1}/${urlList.length}]`
+                );
+            }
+        } else {
+            deadStrikes++;
+
+            console.log(
+                `[WARNING] Stream Unhealthy ` +
+                `(${health.status} | Net:${networkState}) ` +
+                `Strike ${deadStrikes}/5`
+            );
+
+            if (deadStrikes >= 5) {
+                deadStrikes = 0;
+
+                currentUrlIndex =
+                    (currentUrlIndex + 1) %
+                    urlList.length;
+
+                await loadCurrentUrl(
+                    '5 STRIKES -> FAILOVER'
+                );
+
+                freezeStart = Date.now();
+                urlStart = Date.now();
+                lastTime = -1;
+                lastFrames = -1;
+            }
         }
 
-        await sleep(1500);
-      }
+        await new Promise(r =>
+            setTimeout(r, 2000)
+        );
+    }
+}
 
-      log(
-        'warn',
-        'No usable HTML5 video found',
-        { sourceIndex: index + 1 }
-      );
-    } catch (err) {
-      log(
-        'warn',
-        'Page navigation failed',
-        {
-          sourceIndex: index + 1,
-          error: err.message.slice(0, 120)
+// ============================================================
+// ENGINE STARTUP
+// ============================================================
+async function startEngine() {
+    console.log(
+        '[ENGINE] Configuring and starting OBS...'
+    );
+
+    setupOBSConfig();
+
+    obsProcess = spawn('obs', [
+        '--startstreaming',
+        '--minimize-to-tray',
+        '--disable-updater'
+    ]);
+
+    obsProcess.stdout.on('data', data => {
+        const line = data.toString().trim();
+
+        if (
+            line.includes('rtmp') ||
+            line.includes('stream') ||
+            line.includes('Websocket') ||
+            line.includes('output')
+        ) {
+            console.log(`[OBS] ${line}`);
         }
-      );
-    }
-  }
+    });
 
-  return -1;
-}
+    obsProcess.stderr.on('data', data => {
+        const msg = data.toString().trim();
 
-async function monitorPage(
-  page,
-  cfg,
-  signal,
-  requestStop,
-  initialIndex
-) {
-  let sourceIndex = initialIndex;
+        if (
+            msg.toLowerCase().includes('error') ||
+            msg.toLowerCase().includes('fail')
+        ) {
+            console.log(`[OBS ERROR] ${msg}`);
+        }
+    });
 
-  let frames = null;
-  let time = null;
-
-  let lastMovementAt = Date.now();
-  let recovering = 0;
-
-  while (!signal.aborted) {
-    await sleep(4000);
-
-    if (signal.aborted) break;
-
-    if (!page.browser().isConnected()) {
-      throw new Error('Chrome disconnected');
-    }
-
-    const sample = await mediaSample(
-      page,
-      cfg.audio === 'ON'
+    await new Promise(r =>
+        setTimeout(r, 6000)
     );
 
-    const moved = sample && (
-      (
-        sample.frames != null &&
-        (
-          frames == null ||
-          sample.frames > frames
-        )
-      ) ||
-      (
-        Number.isFinite(sample.time) &&
-        (
-          time == null ||
-          sample.time > time + 0.1
-        )
-      )
-    );
+    let obsConnected = false;
 
-    if (moved) {
-      lastMovementAt = Date.now();
+    for (let i = 0; i < 12; i++) {
+        try {
+            await obs.connect(
+                'ws://127.0.0.1:4455',
+                'secret'
+            );
+
+            obsConnected = true;
+
+            console.log(
+                '[OBS] WebSocket connected'
+            );
+
+            break;
+        } catch (e) {
+            await new Promise(r =>
+                setTimeout(r, 2000)
+            );
+        }
     }
 
-    if (sample) {
-      if (sample.frames != null) {
-        frames = sample.frames;
-      }
-
-      if (Number.isFinite(sample.time)) {
-        time = sample.time;
-      }
+    if (obsConnected) {
+        try {
+            await obs.call('StartStream');
+        } catch (e) {}
     }
 
-    if (
-      Date.now() - lastMovementAt < 25000
-    ) {
-      continue;
-    }
-
-    recovering++;
-
-    log(
-      'warn',
-      'Video playback not advancing; attempting failover/reload',
-      {
-        recoveries: recovering,
-        sourceIndex: sourceIndex + 1
-      }
-    );
-
-    if (recovering > 6) {
-      throw new Error(
-        'Playback remained unavailable after six recoveries'
-      );
-    }
-
-    sourceIndex = await openSource(
-      page,
-      cfg,
-      (
-        sourceIndex +
-        (cfg.urls.length > 1 ? 1 : 0)
-      ) % cfg.urls.length,
-      signal
-    );
-
-    if (sourceIndex < 0) {
-      throw new Error(
-        'Could not reopen any playable HTML5 source'
-      );
-    }
-
-    frames = null;
-    time = null;
-    lastMovementAt = Date.now();
-  }
-
-  requestStop();
-}
-
-async function main() {
-  if (
-    process.argv.includes('--check')
-  ) {
-    const cfg = config();
-
-    log(
-      'info',
-      'Configuration valid',
-      {
-        channels: Object.keys(STREAM_KEYS).length,
-        sourceCount: cfg.urls.length,
-        quality: cfg.quality,
-        audio: cfg.audio,
-        durationMinutes:
-          cfg.durationMs / 60000,
-
-        proxyEngine: cfg.proxy
-          ? 'Custom proxy'
-          : 'None'
-      }
-    );
-
-    return;
-  }
-
-  const cfg = config();
-
-  if (!process.env.DISPLAY) {
-    throw new Error(
-      'DISPLAY missing: run via xvfb-run'
-    );
-  }
-
-  const [width, height] =
-    PROFILES[cfg.quality];
-
-  const controller =
-    new AbortController();
-
-  const stop = () =>
-    controller.abort();
-
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
-
-  const durationTimer = setTimeout(
-    stop,
-    cfg.durationMs
-  );
-
-  let browser;
-  let encoder;
-
-  try {
     const args = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--autoplay-policy=no-user-gesture-required',
-
-      `--window-size=${width},${height}`,
-
-      '--window-position=0,0',
-      '--kiosk',
-      '--hide-scrollbars'
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        `--window-size=${RES_W},${RES_H}`,
+        '--window-position=0,0',
+        '--kiosk',
+        '--start-fullscreen',
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-dev-shm-usage',
+        '--use-gl=egl'
     ];
 
-    if (cfg.proxy) {
-      args.push(
-        `--proxy-server=${cfg.proxy.href}`
-      );
+    const ublockPath = path.join(
+        process.cwd(),
+        'ublock-lite'
+    );
+
+    if (
+        fs.existsSync(
+            path.join(ublockPath, 'manifest.json')
+        )
+    ) {
+        args.push(
+            `--disable-extensions-except=${ublockPath}`
+        );
+        args.push(
+            `--load-extension=${ublockPath}`
+        );
+
+        console.log(
+            '[BROWSER] Optional extension loaded'
+        );
     }
 
     browser = await puppeteer.launch({
-      headless: false,
-      defaultViewport: null,
-      args
+        headless: false,
+        defaultViewport: {
+            width: RES_W,
+            height: RES_H
+        },
+        args
     });
 
-    const page =
-      (await browser.pages())[0] ||
-      await browser.newPage();
+    page = (await browser.pages())[0];
 
-    await page.setViewport({
-      width,
-      height,
-      deviceScaleFactor: 1
-    });
+    browser.on('targetcreated', async target => {
+        if (target.type() === 'page') {
+            const newPage = await target.page()
+                .catch(() => null);
 
-    log(
-      'info',
-      'Started browser capture',
-      {
-        sources: cfg.urls.length,
-        channel: cfg.channel,
-        quality: cfg.quality
-      }
-    );
-
-    const initialIndex = await openSource(
-      page,
-      cfg,
-      0,
-      controller.signal
-    );
-
-    if (initialIndex < 0) {
-      throw new Error(
-        'No accessible HTML5 video found in supplied webpages'
-      );
-    }
-
-    const monitoring = monitorPage(
-      page,
-      cfg,
-      controller.signal,
-      stop,
-      initialIndex
-    );
-
-    let done = false;
-
-    monitoring.then(
-      () => {
-        done = true;
-        stop();
-      }
-    ).catch(
-      err => {
-        done = true;
-
-        log(
-          'error',
-          'Playback monitor failed',
-          { error: err.message }
-        );
-
-        stop();
-      }
-    );
-
-    let restarts = 0;
-
-    while (
-      !controller.signal.aborted &&
-      !done
-    ) {
-      encoder = startEncoder(
-        cfg,
-        controller.signal
-      );
-
-      const outcome =
-        await encoder.exited;
-
-      if (controller.signal.aborted) {
-        break;
-      }
-
-      restarts++;
-
-      log(
-        'warn',
-        'Encoder exited; restarting',
-        {
-          attempts: restarts,
-          detail: outcome
+            if (
+                newPage &&
+                newPage !== page
+            ) {
+                setTimeout(
+                    () => newPage.close()
+                        .catch(() => {}),
+                    300
+                );
+            }
         }
-      );
+    });
 
-      if (restarts >= 5) {
-        throw new Error(
-          'FFmpeg could not maintain an output after five attempts'
-        );
-      }
+    keepChromeOnTopAndHideOBS();
 
-      await sleep(
-        Math.min(
-          15000,
-          restarts * 3000
-        )
-      );
-    }
-
-    await monitoring;
-  } finally {
-    clearTimeout(durationTimer);
-
-    stop();
-
-    if (encoder) {
-      encoder.stop();
-    }
-
-    if (browser) {
-      await browser.close()
-        .catch(() => {});
-    }
-
-    log(
-      'info',
-      'Browser relay stopped'
-    );
-  }
+    await setupPageProtections(page);
+    await loadCurrentUrl('INITIAL BOOT');
+    await startWatchdog();
 }
 
-main().catch(err => {
-  log(
-    'error',
-    'Fatal failure',
-    { error: err.message }
-  );
+// ============================================================
+// CLEANUP
+// ============================================================
+async function cleanup() {
+    try {
+        await obs.disconnect();
+    } catch (e) {}
 
-  process.exitCode = 1;
-});
+    if (browser) {
+        try {
+            await browser.close();
+        } catch (e) {}
+
+        browser = null;
+    }
+
+    if (obsProcess) {
+        try {
+            obsProcess.kill('SIGKILL');
+        } catch (e) {}
+
+        obsProcess = null;
+    }
+
+    try {
+        execSync(
+            'pkill -9 obs chrome ffplay || true',
+            { stdio: 'ignore' }
+        );
+    } catch (e) {}
+}
+
+// ============================================================
+// DURATION AND GITHUB ACTIONS RELAY
+// ============================================================
+const RAW_DURATION = (
+    process.env.CUSTOM_DURATION || '24/7'
+).trim();
+
+const MAX_SINGLE_RUN_MS = 21000000;
+
+// Parses 24/7, 10h, 1h 10min, 45m, 30s, etc.
+function parseFlexibleDuration(input) {
+    if (!input) return null;
+
+    const str = input.toLowerCase().trim();
+
+    if (
+        str === '24/7' ||
+        str === 'infinite' ||
+        str === 'forever' ||
+        str === '0'
+    ) {
+        return null;
+    }
+
+    let totalMs = 0;
+    let matched = false;
+
+    const regex =
+        /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/g;
+
+    let match;
+
+    while (
+        (match = regex.exec(str)) !== null
+    ) {
+        matched = true;
+
+        const val = parseFloat(match[1]);
+        const unit = match[2];
+
+        if (unit.startsWith('h')) {
+            totalMs += val * 3600 * 1000;
+        } else if (unit.startsWith('m')) {
+            totalMs += val * 60 * 1000;
+        } else if (unit.startsWith('s')) {
+            totalMs += val * 1000;
+        }
+    }
+
+    if (
+        !matched &&
+        /^\d+(\.\d+)?$/.test(str)
+    ) {
+        totalMs = parseFloat(str) * 60 * 1000;
+        matched = true;
+    }
+
+    return matched && totalMs > 0
+        ? Math.round(totalMs)
+        : null;
+}
+
+function formatMsToDurationString(ms) {
+    const totalSeconds = Math.max(
+        1,
+        Math.round(ms / 1000)
+    );
+
+    const hours = Math.floor(
+        totalSeconds / 3600
+    );
+
+    const minutes = Math.floor(
+        (totalSeconds % 3600) / 60
+    );
+
+    const seconds = totalSeconds % 60;
+
+    const parts = [];
+
+    if (hours > 0) {
+        parts.push(`${hours}h`);
+    }
+
+    if (minutes > 0) {
+        parts.push(`${minutes}m`);
+    }
+
+    if (
+        hours === 0 &&
+        minutes === 0 &&
+        seconds > 0
+    ) {
+        parts.push(`${seconds}s`);
+    }
+
+    return parts.join(' ') || '1m';
+}
+
+// ============================================================
+// WORKFLOW HANDOVER
+// ============================================================
+function triggerNextWorkflow(nextDurationValue) {
+    try {
+        console.log(
+            `[HANDOVER] Starting next workflow: ` +
+            `${nextDurationValue}`
+        );
+
+        const args = [
+            'workflow',
+            'run',
+            'main.yml',
+            '-f',
+            `target_urls=${process.env.TARGET_URLS || ''}`,
+            '-f',
+            `okru_stream_channel=${SELECTED_CHANNEL}`,
+            '-f',
+            `server_selection=${SERVER_SELECTION}`,
+            '-f',
+            `stream_quality=${selectedQuality}`,
+            '-f',
+            `proxy_engine=${PROXY_ENGINE}`,
+            '-f',
+            `enable_stream_audio=${process.env.ENABLE_STREAM_AUDIO || 'ON'}`,
+            '-f',
+            `custom_duration=${nextDurationValue}`
+        ];
+
+        const res = spawn('gh', args, {
+            stdio: 'inherit'
+        });
+
+        res.on('close', code => {
+            console.log(
+                `[HANDOVER] Workflow command exited ` +
+                `with code ${code}`
+            );
+
+            setTimeout(async () => {
+                try {
+                    await obs.call('StopStream');
+                } catch (e) {}
+
+                await cleanup();
+                process.exit(0);
+            }, 60000);
+        });
+    } catch (e) {
+        console.error(
+            '[HANDOVER ERROR]',
+            e.message
+        );
+    }
+}
+
+// ============================================================
+// DURATION CONTROLLER
+// ============================================================
+const totalRequestedMs =
+    parseFlexibleDuration(RAW_DURATION);
+
+if (totalRequestedMs === null) {
+    console.log(
+        '[DURATION] 24/7 mode; runner handover enabled'
+    );
+
+    setTimeout(() => {
+        triggerNextWorkflow('24/7');
+    }, MAX_SINGLE_RUN_MS);
+
+} else if (
+    totalRequestedMs <= MAX_SINGLE_RUN_MS
+) {
+    console.log(
+        `[DURATION] Fixed: ${RAW_DURATION}`
+    );
+
+    setTimeout(async () => {
+        console.log(
+            '[DURATION] Target reached. Stopping stream.'
+        );
+
+        try {
+            await obs.call('StopStream');
+        } catch (e) {}
+
+        await cleanup();
+        process.exit(0);
+
+    }, totalRequestedMs);
+
+} else {
+    const remainingMs =
+        totalRequestedMs - MAX_SINGLE_RUN_MS;
+
+    const nextDurationStr =
+        formatMsToDurationString(remainingMs);
+
+    console.log(
+        `[DURATION] Long relay: ${RAW_DURATION}, ` +
+        `remaining after handover: ${nextDurationStr}`
+    );
+
+    setTimeout(() => {
+        triggerNextWorkflow(nextDurationStr);
+    }, MAX_SINGLE_RUN_MS);
+}
+
+// ============================================================
+// MAIN ENGINE AUTO-RESTART
+// ============================================================
+(async () => {
+    while (true) {
+        try {
+            await startEngine();
+        } catch (err) {
+            console.error(
+                '[ENGINE ERROR] Restarting in 3 seconds:',
+                err.message
+            );
+
+            await cleanup();
+
+            await new Promise(r =>
+                setTimeout(r, 3000)
+            );
+        }
+    }
+})();
