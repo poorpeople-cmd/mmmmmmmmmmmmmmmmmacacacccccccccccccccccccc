@@ -2,11 +2,10 @@
 'use strict';
 
 /**
- * BrowserRelay for webpages you are authorized to rebroadcast.
- * Starts a headful Chrome page in Xvfb; captures its pixels/audio via FFmpeg.
- * No DRM, login, anti-bot or media-access bypass is attempted.
- * Requires: puppeteer, ffmpeg, Xvfb, PulseAudio, openbox.
- * CAUTION: rotate and protect the embedded publishing credentials below.
+ * Browser streaming of authorized, unprotected webpages.
+ * Regular webpage URLs only; no DRM or access-control bypass.
+ * Legacy OK.ru publishing keys are embedded below at user's request.
+ * IMPORTANT: rotate these exposed credentials and keep source private.
  */
 
 const puppeteer = require('puppeteer');
@@ -34,7 +33,7 @@ const STREAM_KEYS = Object.freeze({
   '3.3': '17485986405995_19233134873195_iw63xjblny',
   '3.4': '17485996039787_19233150929515_d3yeoweuam',
   '3.5': '17486002789995_19233161611883_mbg22slybe',
-  '3.6': '17486007770731_19233169934955_teme2zt4fm',
+  '3.6': '17486007770731_18360310237803_teme2zt4fm',
   '4': '15255022345835_15283095800427_vwrupxzstm',
   '4.1': '15255038074475_15283122080363_ai5qqp2we4',
   '4.2': '15255045480043_15283135842923_tldl4bhmii',
@@ -72,195 +71,248 @@ const STREAM_KEYS = Object.freeze({
 });
 
 const SERVER = 'rtmp://vsu.okcdn.ru/input/';
-const CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
-const QUALITY = (process.env.STREAM_QUALITY || '720p').trim();
 
-const PROFILES = {
+const PROFILES = Object.freeze({
   '360p': [640, 360, 800],
   '480p': [854, 480, 1500],
   '720p': [1280, 720, 3000],
-  '1080p': [1920, 1080, 5000]
-};
+  '1080p': [1920, 1080, 5000],
+});
 
-const durationMinutes = Number(process.env.DURATION_MINUTES || 60);
-const browserUrl = (process.env.TARGET_URL || '').trim();
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const log = (level, message, context = {}) =>
+const log = (level, message, details = {}) =>
   console.log(JSON.stringify({
-    time: new Date().toISOString(),
+    timestamp: new Date().toISOString(),
     level,
     message,
-    ...context
+    ...details,
   }));
 
-function validate() {
-  if (!Object.hasOwn(STREAM_KEYS, CHANNEL)) {
-    throw new Error(`Unknown channel ID: ${CHANNEL}`);
+function parseDuration(text) {
+  const raw = String(text || '60m').trim().toLowerCase();
+
+  if (['24/7', 'forever', 'infinite'].includes(raw)) {
+    return null;
   }
 
-  if (!Object.hasOwn(PROFILES, QUALITY)) {
-    throw new Error(`Unsupported quality: ${QUALITY}`);
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    return Number(raw) * 60000;
   }
+
+  let total = 0;
+  let count = 0;
+
+  const unmatched = raw.replace(
+    /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|min|m|seconds?|secs?|s)/g,
+    (_, quantity, unit) => {
+      count++;
+      total += Number(quantity) *
+        (/^h/.test(unit) ? 3600000 :
+          /^m/.test(unit) ? 60000 : 1000);
+      return ' ';
+    }
+  );
 
   if (
-    !Number.isInteger(durationMinutes) ||
-    durationMinutes < 1 ||
-    durationMinutes > 330
+    unmatched.trim() ||
+    !count ||
+    !Number.isFinite(total) ||
+    total <= 0
   ) {
-    throw new Error('DURATION_MINUTES must be an integer from 1 to 330');
-  }
-
-  let parsed;
-  try {
-    parsed = new URL(browserUrl);
-  } catch {
-    throw new Error('TARGET_URL must be a full webpage URL');
-  }
-
-  if (!['https:', 'http:'].includes(parsed.protocol)) {
-    throw new Error('Only HTTP(S) webpages are supported');
-  }
-
-  if (!process.env.DISPLAY) {
-    throw new Error('DISPLAY is missing; launch via xvfb-run');
-  }
-
-  return parsed;
-}
-
-function formatDisplay(display) {
-  return display.includes('.')
-    ? `${display}+0,0`
-    : `${display}.0+0,0`;
-}
-
-async function waitForPlayer(page) {
-  const limit = Date.now() + 35000;
-
-  while (Date.now() < limit) {
-    const results = await Promise.all(
-      page.frames().map(async (frame) => {
-        try {
-          return await frame.evaluate(() => {
-            const videos = [
-              ...document.querySelectorAll('video')
-            ];
-
-            for (const v of videos) {
-              v.muted = false;
-              v.volume = 1;
-
-              if (v.paused) {
-                v.play().catch(() => {});
-              }
-            }
-
-            return videos.length;
-          });
-        } catch {
-          return 0;
-        }
-      })
+    throw new Error(
+      'CUSTOM_DURATION invalid; use 30m, 1h 10m, 24/7'
     );
-
-    if (results.some(n => n > 0)) return true;
-
-    await sleep(1500);
   }
 
-  return false;
+  return Math.round(total);
 }
 
-async function maximizeVideo(page) {
-  for (const frame of page.frames()) {
+function config() {
+  const urls = String(
+    process.env.TARGET_URLS || process.env.TARGET_URL || ''
+  )
+    .split(/[|,\r\n]+/)
+    .map(x => x.trim().split('::')[0].trim())
+    .filter(Boolean);
+
+  if (!urls.length || urls.length > 10) {
+    throw new Error('Provide 1–10 normal webpage URLs');
+  }
+
+  const hosts = urls.map((item, i) => {
+    let u;
+
     try {
-      await frame.evaluate(() => {
-        const videos = [
-          ...document.querySelectorAll('video')
-        ];
-
-        if (!videos.length) return;
-
-        const video = videos.sort((a, b) =>
-          (b.clientWidth * b.clientHeight) -
-          (a.clientWidth * a.clientHeight)
-        )[0];
-
-        const style =
-          document.getElementById('relay-style') ||
-          document.createElement('style');
-
-        style.id = 'relay-style';
-        style.textContent =
-          `html,body{margin:0!important;background:#000!important;overflow:hidden!important}`;
-
-        document.head.appendChild(style);
-
-        video.style.setProperty(
-          'position', 'fixed', 'important'
-        );
-        video.style.setProperty(
-          'inset', '0', 'important'
-        );
-        video.style.setProperty(
-          'width', '100vw', 'important'
-        );
-        video.style.setProperty(
-          'height', '100vh', 'important'
-        );
-        video.style.setProperty(
-          'object-fit', 'contain', 'important'
-        );
-        video.style.setProperty(
-          'z-index', '2147483000', 'important'
-        );
-
-        if (video.paused) {
-          video.play().catch(() => {});
-        }
-      });
+      u = new URL(item);
     } catch {
-      // Detached or inaccessible frames can fail.
+      throw new Error(`Webpage URL ${i + 1} is invalid`);
+    }
+
+    if (!['http:', 'https:'].includes(u.protocol)) {
+      throw new Error(
+        `Webpage URL ${i + 1} must use http(s)`
+      );
+    }
+
+    return u.hostname;
+  });
+
+  const channel = String(
+    process.env.OKRU_STREAM_ID || '1'
+  ).trim();
+
+  if (!Object.hasOwn(STREAM_KEYS, channel)) {
+    throw new Error(`Unknown OKRU_STREAM_ID: ${channel}`);
+  }
+
+  const quality = String(
+    process.env.STREAM_QUALITY || '720p'
+  ).trim();
+
+  if (!Object.hasOwn(PROFILES, quality)) {
+    throw new Error(`Unknown STREAM_QUALITY: ${quality}`);
+  }
+
+  const audio = String(
+    process.env.ENABLE_STREAM_AUDIO || 'ON'
+  ).toUpperCase();
+
+  if (!['ON', 'OFF'].includes(audio)) {
+    throw new Error('ENABLE_STREAM_AUDIO must be ON or OFF');
+  }
+
+  const proxyEngine = String(
+    process.env.PROXY_ENGINE || 'None'
+  );
+
+  if (!['None', 'Custom proxy'].includes(proxyEngine)) {
+    throw new Error('Unsupported PROXY_ENGINE');
+  }
+
+  let proxy = null;
+
+  if (proxyEngine === 'Custom proxy') {
+    const raw = (
+      process.env.BROWSER_PROXY_URL || ''
+    ).trim();
+
+    if (!raw) {
+      throw new Error(
+        'Custom proxy requires BROWSER_PROXY_URL repository secret'
+      );
+    }
+
+    try {
+      proxy = new URL(raw);
+    } catch {
+      throw new Error(
+        'BROWSER_PROXY_URL must be a valid proxy URL'
+      );
+    }
+
+    if (
+      !['http:', 'https:', 'socks5:'].includes(proxy.protocol)
+    ) {
+      throw new Error(
+        'Proxy must be HTTP(S) or SOCKS5'
+      );
+    }
+
+    if (proxy.username || proxy.password) {
+      throw new Error(
+        'This version supports unauthenticated proxies only'
+      );
     }
   }
+
+  const wanted = parseDuration(
+    process.env.CUSTOM_DURATION || '60m'
+  );
+
+  const durationMs = Math.min(
+    wanted === null ? 330 * 60000 : wanted,
+    330 * 60000
+  );
+
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs <= 0
+  ) {
+    throw new Error('Duration must be positive');
+  }
+
+  return {
+    urls,
+    hosts,
+    channel,
+    quality,
+    audio,
+    proxy,
+
+    serverSelection: String(
+      process.env.SERVER_SELECTION || 'None'
+    ).trim(),
+
+    durationMs,
+
+    output: SERVER + STREAM_KEYS[channel],
+  };
 }
 
-function ffmpegArgs(width, height, videoBitrate, output) {
-  const fps = 30;
+function displayName(value) {
+  return value.includes('.')
+    ? `${value}+0,0`
+    : `${value}.0+0,0`;
+}
 
-  return [
+function encoderArgs(cfg) {
+  const [w, h, rate] = PROFILES[cfg.quality];
+
+  const args = [
     '-hide_banner',
     '-nostdin',
     '-loglevel', 'warning',
-    '-stats_period', '5',
+    '-stats_period', '4',
     '-progress', 'pipe:3',
 
     '-thread_queue_size', '512',
     '-f', 'x11grab',
-    '-framerate', String(fps),
-    '-video_size', `${width}x${height}`,
-    '-i', formatDisplay(process.env.DISPLAY),
+    '-framerate', '30',
+    '-video_size', `${w}x${h}`,
+    '-i', displayName(process.env.DISPLAY),
+  ];
 
-    '-thread_queue_size', '512',
-    '-f', 'pulse',
-    '-i', 'stream_sink.monitor',
+  if (cfg.audio === 'ON') {
+    args.push(
+      '-thread_queue_size', '512',
+      '-f', 'pulse',
+      '-i', 'stream_sink.monitor'
+    );
+  } else {
+    args.push(
+      '-f', 'lavfi',
+      '-i',
+      'anullsrc=channel_layout=stereo:sample_rate=48000'
+    );
+  }
 
+  args.push(
     '-map', '0:v:0',
     '-map', '1:a:0',
 
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
+
     '-pix_fmt', 'yuv420p',
+    '-b:v', `${rate}k`,
+    '-maxrate', `${rate}k`,
+    '-bufsize', `${rate * 2}k`,
 
-    '-b:v', `${videoBitrate}k`,
-    '-maxrate', `${videoBitrate}k`,
-    '-bufsize', `${videoBitrate * 2}k`,
-
-    '-g', String(fps * 2),
-    '-keyint_min', String(fps * 2),
+    '-g', '60',
+    '-keyint_min', '60',
     '-sc_threshold', '0',
 
     '-c:a', 'aac',
@@ -269,151 +321,580 @@ function ffmpegArgs(width, height, videoBitrate, output) {
     '-ac', '2',
 
     '-f', 'flv',
-    output
-  ];
-}
-
-function createEncoder(profile, output, abortSignal) {
-  const [width, height, bitrate] = profile;
-
-  const child = spawn(
-    'ffmpeg',
-    ffmpegArgs(width, height, bitrate, output),
-    { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] }
+    cfg.output
   );
 
-  let lastProgressAt = Date.now();
+  return args;
+}
+
+function startEncoder(cfg, signal) {
+  const child = spawn('ffmpeg', encoderArgs(cfg), {
+    stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
+  });
+
+  let lastAdvance = Date.now();
+  let lastFrames = -1;
+  let lastPts = -1;
   let progressText = '';
-  let stderrTail = '';
-  let terminated = false;
-
-  const watch = setInterval(() => {
-    if (
-      Date.now() - lastProgressAt > 45000 &&
-      !terminated
-    ) {
-      log('error', 'FFmpeg encoder made no progress in 45 seconds');
-      child.kill('SIGTERM');
-    }
-  }, 5000);
-
-  const stop = () => {
-    if (terminated) return;
-
-    terminated = true;
-    child.kill('SIGTERM');
-
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-    }, 5000);
-
-    timer.unref();
-  };
-
-  abortSignal.addEventListener('abort', stop, {
-    once: true
-  });
-
-  child.stdio[3].on('data', chunk => {
-    progressText += chunk.toString('utf8');
-
-    const lines = progressText.split('\n');
-    progressText = lines.pop() || '';
-
-    for (const line of lines) {
-      if (line.startsWith('progress=')) {
-        lastProgressAt = Date.now();
-      }
-    }
-  });
-
-  child.stderr.on('data', chunk => {
-    // Never print raw stderr; it can contain RTMP keys.
-    stderrTail = (
-      stderrTail + chunk.toString('utf8')
-    ).slice(-6000);
-  });
+  let progress = {};
+  let stderr = '';
+  let stopped = false;
+  let resultResolved = false;
+  let resolveExit;
 
   const exited = new Promise(resolve => {
-    child.once('error', e =>
-      resolve({ error: e.message })
+    resolveExit = resolve;
+  });
+
+  const finish = (detail) => {
+    if (resultResolved) return;
+
+    resultResolved = true;
+    clearInterval(watcher);
+    signal.removeEventListener('abort', stop);
+    resolveExit(detail);
+  };
+
+  function stop() {
+    if (stopped) return;
+
+    stopped = true;
+    child.kill('SIGTERM');
+
+    const force = setTimeout(
+      () => child.kill('SIGKILL'),
+      5000
     );
 
-    child.once('close', (code, signal) => {
-      clearInterval(watch);
+    force.unref();
+  }
 
-      abortSignal.removeEventListener(
-        'abort', stop
-      );
+  child.once('error', e =>
+    finish({ error: e.code || e.message })
+  );
 
-      resolve({
-        code,
-        signal,
-        error:
-          /Connection refused|broken pipe|Input\/output error/i
-            .test(stderrTail)
-            ? 'RTMP network failure'
-            : undefined
-      });
+  child.once('close', (code, sig) => {
+    finish({
+      code,
+      signal: sig,
+
+      cause:
+        /Connection refused|broken pipe|Input\/output error/i
+          .test(stderr)
+          ? 'RTMP connection error'
+          : 'Encoder ended'
     });
   });
 
-  return { child, stop, exited };
+  signal.addEventListener('abort', stop, {
+    once: true
+  });
+
+  child.stdio[3].on('data', bytes => {
+    progressText += bytes.toString('utf8');
+
+    if (progressText.length > 100000) {
+      progressText = progressText.slice(-10000);
+    }
+
+    let idx;
+
+    while (
+      (idx = progressText.indexOf('\n')) >= 0
+    ) {
+      const line = progressText
+        .slice(0, idx)
+        .trim();
+
+      progressText = progressText.slice(idx + 1);
+
+      const sep = line.indexOf('=');
+
+      if (sep < 1) continue;
+
+      progress[line.slice(0, sep)] =
+        line.slice(sep + 1);
+
+      if (!line.startsWith('progress=')) {
+        continue;
+      }
+
+      const f = Number(progress.frame);
+
+      const pts = Number(
+        progress.out_time_us ??
+        progress.out_time_ms
+      );
+
+      if (
+        (Number.isFinite(f) && f > lastFrames) ||
+        (Number.isFinite(pts) && pts > lastPts)
+      ) {
+        lastAdvance = Date.now();
+      }
+
+      if (Number.isFinite(f)) {
+        lastFrames = Math.max(f, lastFrames);
+      }
+
+      if (Number.isFinite(pts)) {
+        lastPts = Math.max(pts, lastPts);
+      }
+
+      progress = {};
+    }
+  });
+
+  child.stderr.on('data', bytes => {
+    stderr = (
+      stderr + bytes.toString('utf8')
+    ).slice(-5000);
+  });
+
+  const watcher = setInterval(() => {
+    if (
+      !stopped &&
+      Date.now() - lastAdvance > 45000
+    ) {
+      log(
+        'warn',
+        'FFmpeg output not advancing; restarting'
+      );
+
+      stop();
+    }
+  }, 5000);
+
+  return { exited, stop };
 }
 
-async function main() {
-  if (process.argv.includes('--check')) {
-    console.log(
-      'Syntax and module load passed; configured channels:',
-      Object.keys(STREAM_KEYS).length
-    );
+async function mediaSample(page, unmute) {
+  const readings = await Promise.all(
+    page.frames().map(
+      frame => frame.evaluate((hasAudio) => {
+        const videos = [
+          ...document.querySelectorAll('video')
+        ];
+
+        if (!videos.length) return null;
+
+        videos.sort(
+          (a, b) =>
+            (b.clientWidth * b.clientHeight) -
+            (a.clientWidth * a.clientHeight)
+        );
+
+        const v = videos[0];
+
+        v.muted = !hasAudio;
+
+        if (hasAudio) {
+          v.volume = 1;
+        }
+
+        if (v.paused) {
+          v.play().catch(() => {});
+        }
+
+        const n =
+          v.getVideoPlaybackQuality?.().totalVideoFrames;
+
+        return {
+          time: Number(v.currentTime),
+
+          frames: Number.isFinite(n)
+            ? n
+            : null,
+
+          paused: v.paused,
+          ready: v.readyState,
+          width: v.videoWidth,
+          height: v.videoHeight
+        };
+      }, unmute).catch(() => null)
+    )
+  );
+
+  return readings.find(
+    x => x && x.width > 0 && x.height > 0
+  ) || readings.find(Boolean) || null;
+}
+
+async function chooseServer(page, label) {
+  if (
+    !label ||
+    label.toLowerCase() === 'none'
+  ) {
     return;
   }
 
-  const url = validate();
+  for (const frame of page.frames()) {
+    try {
+      const clicked = await frame.evaluate(
+        (name) => {
+          const elems = [
+            ...document.querySelectorAll(
+              'button,a,[role="button"],input[type="button"]'
+            )
+          ];
 
-  const [width, height] = PROFILES[QUALITY];
-  const output = SERVER + STREAM_KEYS[CHANNEL];
+          const normalized = (s) =>
+            String(s || '')
+              .trim()
+              .toLowerCase();
 
-  log('info', 'Starting authorized webpage relay', {
-    domain: url.hostname,
-    channel: CHANNEL,
-    quality: QUALITY,
-    durationMinutes
-  });
+          const match = elems.find(
+            el => normalized(
+              el.innerText ||
+              el.value ||
+              el.getAttribute('aria-label')
+            ) === normalized(name)
+          );
 
-  const controller = new AbortController();
+          if (!match) return false;
 
-  const shutdown = () => controller.abort();
+          match.click();
 
-  process.once('SIGTERM', shutdown);
-  process.once('SIGINT', shutdown);
+          return true;
+        },
+        label
+      );
 
-  const deadline = setTimeout(
-    shutdown,
-    durationMinutes * 60000
+      if (clicked) {
+        log(
+          'info',
+          'Requested server button clicked',
+          { button: label }
+        );
+
+        await sleep(2000);
+        return;
+      }
+    } catch {
+      // Frame may have detached.
+    }
+  }
+
+  log(
+    'warn',
+    'No matching server button found; leaving the webpage unchanged'
+  );
+}
+
+async function maximizeVideo(page) {
+  for (const frame of page.frames()) {
+    try {
+      await frame.evaluate(() => {
+        const v = [
+          ...document.querySelectorAll('video')
+        ].sort(
+          (a, b) =>
+            (b.clientWidth * b.clientHeight) -
+            (a.clientWidth * a.clientHeight)
+        )[0];
+
+        if (!v) return;
+
+        const style =
+          document.getElementById('relay-css') ||
+          document.createElement('style');
+
+        style.id = 'relay-css';
+
+        style.textContent =
+          'html,body{margin:0!important;background:#000!important;overflow:hidden!important;}';
+
+        (
+          document.head ||
+          document.documentElement
+        ).appendChild(style);
+
+        v.style.cssText =
+          'position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;object-fit:contain!important;z-index:2147483000!important;';
+      });
+    } catch {
+      // Iframe may be navigating.
+    }
+  }
+
+  await page.evaluate(() => {
+    const items = [
+      ...document.querySelectorAll('iframe')
+    ].filter(
+      x =>
+        x.clientWidth > 100 &&
+        x.clientHeight > 70
+    );
+
+    if (items.length === 1) {
+      items[0].style.cssText =
+        'position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;border:0!important;z-index:2147482999!important;';
+    }
+  }).catch(() => {});
+}
+
+async function openSource(
+  page,
+  cfg,
+  preferredIndex,
+  signal
+) {
+  for (
+    let attempt = 0;
+    attempt < cfg.urls.length;
+    attempt++
+  ) {
+    if (signal.aborted) return -1;
+
+    const index =
+      (preferredIndex + attempt) %
+      cfg.urls.length;
+
+    log('info', 'Opening authorized webpage', {
+      sourceIndex: index + 1,
+      host: cfg.hosts[index]
+    });
+
+    try {
+      await page.goto(cfg.urls[index], {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000
+      });
+
+      await chooseServer(
+        page,
+        cfg.serverSelection
+      );
+
+      const deadline =
+        Date.now() + 25000;
+
+      while (
+        Date.now() < deadline &&
+        !signal.aborted
+      ) {
+        const sample = await mediaSample(
+          page,
+          cfg.audio === 'ON'
+        );
+
+        if (
+          sample &&
+          sample.width > 0 &&
+          sample.height > 0
+        ) {
+          await maximizeVideo(page);
+          return index;
+        }
+
+        await sleep(1500);
+      }
+
+      log(
+        'warn',
+        'No usable HTML5 video found',
+        { sourceIndex: index + 1 }
+      );
+    } catch (err) {
+      log(
+        'warn',
+        'Page navigation failed',
+        {
+          sourceIndex: index + 1,
+          error: err.message.slice(0, 120)
+        }
+      );
+    }
+  }
+
+  return -1;
+}
+
+async function monitorPage(
+  page,
+  cfg,
+  signal,
+  requestStop,
+  initialIndex
+) {
+  let sourceIndex = initialIndex;
+
+  let frames = null;
+  let time = null;
+
+  let lastMovementAt = Date.now();
+  let recovering = 0;
+
+  while (!signal.aborted) {
+    await sleep(4000);
+
+    if (signal.aborted) break;
+
+    if (!page.browser().isConnected()) {
+      throw new Error('Chrome disconnected');
+    }
+
+    const sample = await mediaSample(
+      page,
+      cfg.audio === 'ON'
+    );
+
+    const moved = sample && (
+      (
+        sample.frames != null &&
+        (
+          frames == null ||
+          sample.frames > frames
+        )
+      ) ||
+      (
+        Number.isFinite(sample.time) &&
+        (
+          time == null ||
+          sample.time > time + 0.1
+        )
+      )
+    );
+
+    if (moved) {
+      lastMovementAt = Date.now();
+    }
+
+    if (sample) {
+      if (sample.frames != null) {
+        frames = sample.frames;
+      }
+
+      if (Number.isFinite(sample.time)) {
+        time = sample.time;
+      }
+    }
+
+    if (
+      Date.now() - lastMovementAt < 25000
+    ) {
+      continue;
+    }
+
+    recovering++;
+
+    log(
+      'warn',
+      'Video playback not advancing; attempting failover/reload',
+      {
+        recoveries: recovering,
+        sourceIndex: sourceIndex + 1
+      }
+    );
+
+    if (recovering > 6) {
+      throw new Error(
+        'Playback remained unavailable after six recoveries'
+      );
+    }
+
+    sourceIndex = await openSource(
+      page,
+      cfg,
+      (
+        sourceIndex +
+        (cfg.urls.length > 1 ? 1 : 0)
+      ) % cfg.urls.length,
+      signal
+    );
+
+    if (sourceIndex < 0) {
+      throw new Error(
+        'Could not reopen any playable HTML5 source'
+      );
+    }
+
+    frames = null;
+    time = null;
+    lastMovementAt = Date.now();
+  }
+
+  requestStop();
+}
+
+async function main() {
+  if (
+    process.argv.includes('--check')
+  ) {
+    const cfg = config();
+
+    log(
+      'info',
+      'Configuration valid',
+      {
+        channels: Object.keys(STREAM_KEYS).length,
+        sourceCount: cfg.urls.length,
+        quality: cfg.quality,
+        audio: cfg.audio,
+        durationMinutes:
+          cfg.durationMs / 60000,
+
+        proxyEngine: cfg.proxy
+          ? 'Custom proxy'
+          : 'None'
+      }
+    );
+
+    return;
+  }
+
+  const cfg = config();
+
+  if (!process.env.DISPLAY) {
+    throw new Error(
+      'DISPLAY missing: run via xvfb-run'
+    );
+  }
+
+  const [width, height] =
+    PROFILES[cfg.quality];
+
+  const controller =
+    new AbortController();
+
+  const stop = () =>
+    controller.abort();
+
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+
+  const durationTimer = setTimeout(
+    stop,
+    cfg.durationMs
   );
 
   let browser;
   let encoder;
 
   try {
+    const args = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--autoplay-policy=no-user-gesture-required',
+
+      `--window-size=${width},${height}`,
+
+      '--window-position=0,0',
+      '--kiosk',
+      '--hide-scrollbars'
+    ];
+
+    if (cfg.proxy) {
+      args.push(
+        `--proxy-server=${cfg.proxy.href}`
+      );
+    }
+
     browser = await puppeteer.launch({
       headless: false,
       defaultViewport: null,
-
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-
-        '--autoplay-policy=no-user-gesture-required',
-
-        `--window-size=${width},${height}`,
-        '--window-position=0,0',
-        '--kiosk',
-        '--hide-scrollbars'
-      ]
+      args
     });
 
     const page =
@@ -426,178 +907,129 @@ async function main() {
       deviceScaleFactor: 1
     });
 
-    await page.goto(browserUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000
-    });
+    log(
+      'info',
+      'Started browser capture',
+      {
+        sources: cfg.urls.length,
+        channel: cfg.channel,
+        quality: cfg.quality
+      }
+    );
 
-    const found = await waitForPlayer(page);
+    const initialIndex = await openSource(
+      page,
+      cfg,
+      0,
+      controller.signal
+    );
 
-    if (!found) {
+    if (initialIndex < 0) {
       throw new Error(
-        'No HTML5 video found on webpage after 35s. ' +
-        'This browser relay does not extract protected media ' +
-        'or handle players requiring manual login/interactions.'
+        'No accessible HTML5 video found in supplied webpages'
       );
     }
 
-    await maximizeVideo(page);
+    const monitoring = monitorPage(
+      page,
+      cfg,
+      controller.signal,
+      stop,
+      initialIndex
+    );
 
-    let lastVideoFrames = -1;
-    let lastMediaTime = -1;
-    let lastMovement = Date.now();
-    let lastReloadAt = 0;
-    let reloads = 0;
+    let done = false;
 
-    const playerMonitor = setInterval(async () => {
-      if (controller.signal.aborted) return;
-
-      try {
-        let sample = null;
-
-        for (const frame of page.frames()) {
-          const value = await frame.evaluate(() => {
-            const v = document.querySelector('video');
-
-            if (!v) return null;
-
-            if (v.paused) {
-              v.play().catch(() => {});
-            }
-
-            return {
-              frames:
-                v.getVideoPlaybackQuality?.().totalVideoFrames ??
-                null,
-
-              time: v.currentTime,
-              paused: v.paused
-            };
-          }).catch(() => null);
-
-          if (value) {
-            sample = value;
-            break;
-          }
-        }
-
-        if (!sample) return;
-
-        const moved =
-          (
-            sample.frames != null &&
-            sample.frames > lastVideoFrames
-          ) ||
-          sample.time > lastMediaTime + 0.1;
-
-        if (moved) {
-          lastMovement = Date.now();
-        }
-
-        if (sample.frames != null) {
-          lastVideoFrames = sample.frames;
-        }
-
-        lastMediaTime = sample.time;
-
-        if (
-          !moved &&
-          Date.now() - lastMovement > 25000 &&
-          Date.now() - lastReloadAt > 25000
-        ) {
-          if (reloads >= 5) {
-            log(
-              'error',
-              'Exceeded webpage reload limit'
-            );
-
-            controller.abort();
-            return;
-          }
-
-          reloads++;
-          lastReloadAt = Date.now();
-
-          log(
-            'warn',
-            'Playback not advancing; reloading page',
-            { reloads }
-          );
-
-          await page.reload({
-            waitUntil: 'domcontentloaded',
-            timeout: 45000
-          });
-
-          await waitForPlayer(page);
-          await maximizeVideo(page);
-
-          lastVideoFrames = -1;
-          lastMediaTime = -1;
-          lastMovement = Date.now();
-        }
-      } catch (err) {
-        log('warn', 'Player monitor warning', {
-          error: err.message
-        });
+    monitoring.then(
+      () => {
+        done = true;
+        stop();
       }
-    }, 5000);
+    ).catch(
+      err => {
+        done = true;
 
-    try {
-      let consecutiveFailures = 0;
-
-      while (!controller.signal.aborted) {
-        encoder = createEncoder(
-          PROFILES[QUALITY],
-          output,
-          controller.signal
+        log(
+          'error',
+          'Playback monitor failed',
+          { error: err.message }
         );
 
-        const result = await encoder.exited;
+        stop();
+      }
+    );
 
-        if (controller.signal.aborted) break;
+    let restarts = 0;
 
-        consecutiveFailures++;
+    while (
+      !controller.signal.aborted &&
+      !done
+    ) {
+      encoder = startEncoder(
+        cfg,
+        controller.signal
+      );
 
-        log('warn', 'Encoder exited; attempting restart', {
-          ...result,
-          attempts: consecutiveFailures
-        });
+      const outcome =
+        await encoder.exited;
 
-        if (consecutiveFailures >= 5) {
-          throw new Error(
-            'FFmpeg repeatedly failed; check source, ' +
-            'PulseAudio, video capture and destination account'
-          );
+      if (controller.signal.aborted) {
+        break;
+      }
+
+      restarts++;
+
+      log(
+        'warn',
+        'Encoder exited; restarting',
+        {
+          attempts: restarts,
+          detail: outcome
         }
+      );
 
-        await sleep(
-          Math.min(
-            20000,
-            consecutiveFailures * 4000
-          )
+      if (restarts >= 5) {
+        throw new Error(
+          'FFmpeg could not maintain an output after five attempts'
         );
       }
-    } finally {
-      clearInterval(playerMonitor);
+
+      await sleep(
+        Math.min(
+          15000,
+          restarts * 3000
+        )
+      );
     }
-  } finally {
-    clearTimeout(deadline);
 
-    if (encoder) encoder.stop();
+    await monitoring;
+  } finally {
+    clearTimeout(durationTimer);
+
+    stop();
+
+    if (encoder) {
+      encoder.stop();
+    }
 
     if (browser) {
-      await browser.close().catch(() => {});
+      await browser.close()
+        .catch(() => {});
     }
 
-    log('info', 'Relay stopped');
+    log(
+      'info',
+      'Browser relay stopped'
+    );
   }
 }
 
-main().catch(error => {
-  log('error', 'Relay failure', {
-    error: error.message
-  });
+main().catch(err => {
+  log(
+    'error',
+    'Fatal failure',
+    { error: err.message }
+  );
 
   process.exitCode = 1;
 });
